@@ -14,7 +14,7 @@
 set -o pipefail
 export LC_ALL=C
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 SCHEMA="amnezia-doctor/1"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="$SELF_DIR/lib"
@@ -60,7 +60,7 @@ done
 # ================================================================ утилиты
 
 say()  { printf '%s\n' "$*" >&2; }
-step() { printf '\n== %s\n' "$*" >&2; }
+step() { printf '\n🔍 %s\n' "$*" >&2; }
 
 # таймаут без coreutils: alarm переживает exec и завершает процесс по истечении
 to() { local s="$1"; shift; perl -e 'alarm shift @ARGV; exec @ARGV; exit 127' "$s" "$@"; }
@@ -903,7 +903,13 @@ write_reports() {
     WARN) label="РАБОТАЕТ С ЗАМЕЧАНИЯМИ" ;;
     *) status=OK; label="ИСПРАВНО" ;;
   esac
-  VERDICT_LABEL="$label"; VERDICT_TITLE="$ptitle"
+  VERDICT_TITLE="$ptitle"; VERDICT_STATUS="$status"; VERDICT_REC="$prec"
+  local vicon vbig
+  case "$status" in
+    FAIL) vicon="❌"; vbig="НЕ РАБОТАЕТ" ;;
+    WARN) vicon="⚠️"; vbig="РАБОТАЕТ, НО ЕСТЬ ЗАМЕЧАНИЯ" ;;
+    *)    vicon="✅"; vbig="ВСЁ РАБОТАЕТ" ;;
+  esac
 
   {
     echo "# Amnezia Doctor — отчёт"
@@ -915,32 +921,38 @@ write_reports() {
     echo "| Время запуска | $(getf META_STARTED) |"
     echo "| Mac | macOS $(getf C_MACOS), $(getf C_ARCH) |"
     echo
-    echo "## Вердикт: $label"
-    echo
+    echo "> # $vicon $vbig"
+    echo ">"
     if [ "$status" = OK ]; then
-      echo "Проблем не найдено."
+      echo "> Проблем не найдено. Вердикт: **$label**."
     else
-      echo "**Главная причина — [$pid] $ptitle**"
-      echo
-      [ -n "$prec" ] && echo "Что сделать: $prec"
+      echo "> **Главная причина — [$pid] $ptitle**"
+      if [ -n "$prec" ]; then echo ">"; echo "> 👉 **Что сделать:** $prec"; fi
     fi
+    echo
+    echo "## Все проверки"
+    echo
+    awk -F'\t' '{
+      e = ($1 == "FAIL") ? "❌" : ($1 == "WARN") ? "⚠️" : ($1 == "INFO") ? "ℹ️" : "✅"
+      printf "- %s %s\n", e, $3
+    }' "$FIND"
     echo
     local lvl head
     for lvl in FAIL WARN INFO; do
-      case "$lvl" in FAIL) head="Неисправности" ;; WARN) head="Замечания" ;; INFO) head="К сведению" ;; esac
+      case "$lvl" in FAIL) head="❌ Неисправности" ;; WARN) head="⚠️ Замечания" ;; INFO) head="ℹ️ К сведению" ;; esac
       if awk -F'\t' -v l="$lvl" '$1==l{f=1} END{exit !f}' "$FIND"; then
         echo "## $head ($lvl)"
         echo
         awk -F'\t' -v l="$lvl" '$1==l {
           printf "- **[%s] %s**\n", $2, $3
           if ($4 != "") printf "  - Факты: %s\n", $4
-          if ($5 != "") printf "  - Что сделать: %s\n", $5
+          if ($5 != "") printf "  - 👉 Что сделать: %s\n", $5
         }' "$FIND"
         echo
       fi
     done
     if awk -F'\t' '$1=="OK"{f=1} END{exit !f}' "$FIND"; then
-      echo "## Работает (OK)"
+      echo "## ✅ Работает (OK)"
       echo
       awk -F'\t' '$1=="OK" { printf "- [%s] %s%s\n", $2, $3, ($4 != "" ? " — " $4 : "") }' "$FIND"
       echo
@@ -962,6 +974,50 @@ write_reports() {
   cp "$SELF_DIR/docs/LLM_PROMPT.md" "$OUT/LLM_PROMPT.md" 2>/dev/null
 }
 
+# ================================================================ экран вердикта
+
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  T_RST=$'\033[0m'; T_B=$'\033[1m'; T_EOL=$'\033[K'
+  T_BG_OK=$'\033[42;30m'; T_BG_WARN=$'\033[43;30m'; T_BG_FAIL=$'\033[41;97m'
+  T_OK=$'\033[32m'; T_WARN=$'\033[33m'; T_FAIL=$'\033[31m'; T_INFO=$'\033[36m'
+else
+  T_RST=""; T_B=""; T_EOL=""; T_BG_OK=""; T_BG_WARN=""; T_BG_FAIL=""; T_OK=""; T_WARN=""; T_FAIL=""; T_INFO=""
+fi
+
+# Цветная плашка во всю ширину окна: фон тянется до края через «стереть до конца строки»
+bar() {  # фон текст
+  if [ -n "$1" ]; then printf '%s%s%s%s\n' "$1" "$2" "$T_EOL" "$T_RST"
+  else printf '%s\n' "${2:-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━}"; fi
+}
+
+show_verdict() {
+  local bg icon big sub
+  case "$VERDICT_STATUS" in
+    FAIL) bg="$T_BG_FAIL"; icon="❌"; big="НЕ РАБОТАЕТ";                  sub="$VERDICT_TITLE" ;;
+    WARN) bg="$T_BG_WARN"; icon="⚠️ "; big="РАБОТАЕТ, НО ЕСТЬ ЗАМЕЧАНИЯ"; sub="$VERDICT_TITLE" ;;
+    *)    bg="$T_BG_OK";   icon="✅"; big="ВСЁ РАБОТАЕТ";                 sub="Проблем не найдено" ;;
+  esac
+  {
+    printf '\n'
+    bar "$bg" ""
+    bar "$bg" "$T_B   $icon  $big"
+    bar "$bg" "       $sub"
+    bar "$bg" ""
+    printf '\n'
+    if [ "$VERDICT_STATUS" != OK ] && [ -n "$VERDICT_REC" ]; then
+      printf '%s👉 Что сделать:%s %s\n\n' "$T_B" "$T_RST" "$VERDICT_REC"
+    fi
+    printf '%sПроверки:%s\n' "$T_B" "$T_RST"
+    awk -F'\t' -v ok="$T_OK" -v wa="$T_WARN" -v fa="$T_FAIL" -v in_="$T_INFO" -v r="$T_RST" '{
+      if ($1 == "FAIL")      { e = "❌"; c = fa }
+      else if ($1 == "WARN") { e = "⚠️ "; c = wa }
+      else if ($1 == "INFO") { e = "ℹ️ "; c = in_ }
+      else                   { e = "✅"; c = ok }
+      printf "  %s %s%s%s\n", e, c, $3, r
+    }' "$FIND"
+  } >&2
+}
+
 normalize_facts() {
   # первое значение ключа побеждает; сортировка — для стабильности отчёта
   awk '{ k = $0; sub(/=.*/, "", k); if (!(k in s)) { s[k] = 1; print } }' "$FACTS" | LC_ALL=C sort > "$FACTS.tmp" && mv "$FACTS.tmp" "$FACTS"
@@ -976,8 +1032,9 @@ if [ -n "$ANALYZE_DIR" ]; then
   normalize_facts
   analyze
   write_reports
-  say "Вердикт: $VERDICT_LABEL${VERDICT_TITLE:+ — $VERDICT_TITLE}"
-  say "Отчёт: $OUT/report.md"
+  show_verdict
+  say ""
+  say "📄 Отчёт: $OUT/report.md"
   exit 0
 fi
 
@@ -1027,9 +1084,7 @@ analyze
 write_reports
 ( cd "$OUT_BASE" && zip -qr "$NAME.zip" "$NAME" )
 
-printf '\n========================================\n' >&2
-say "Вердикт: $VERDICT_LABEL${VERDICT_TITLE:+ — $VERDICT_TITLE}"
-awk -F'\t' '$1=="FAIL" || $1=="WARN" { printf "  %s [%s] %s\n", $1, $2, $3 }' "$OUT/findings.tsv" >&2
+show_verdict
 say ""
-say "Отчёт:  $OUT/report.md"
-say "Архив:  $OUT_BASE/$NAME.zip  ← его и пришлите"
+say "📄 Отчёт:  $OUT/report.md"
+say "📦 Архив:  $OUT_BASE/$NAME.zip  ← его и пришлите"
