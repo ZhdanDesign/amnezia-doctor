@@ -14,7 +14,7 @@
 set -o pipefail
 export LC_ALL=C
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 SCHEMA="amnezia-doctor/1"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="$SELF_DIR/lib"
@@ -1137,7 +1137,7 @@ share_menu() {  # архив
     i=$((i + 1)); acts="$acts codex"
     printf '  %s) 🤖 Починить с помощью Codex%s\n' "$i" "$([ "$def" = codex ] && printf ' ← Enter')"
     i=$((i + 1)); acts="$acts claude"; printf '  %s) 🤖 Починить с помощью Claude Code\n' "$i"
-    if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — откроется Telegram, архив будет в буфере: выберите чат и ⌘V\n' "$i"; fi
+    if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — откроются Telegram и Finder: перетащите архив в чат\n' "$i"; fi
     if [ -n "$mail" ]; then i=$((i + 1)); acts="$acts mail"; printf '  %s) ✉️  Почта — новое письмо с архивом во вложении\n' "$i"; fi
     i=$((i + 1)); acts="$acts clip"; printf '  %s) 📋 Скопировать архив — вставьте ⌘V в любой мессенджер (WhatsApp, Telegram, Slack…)\n' "$i"
     i=$((i + 1)); acts="$acts finder"; printf '  %s) 📂 Показать в Finder — перетащите архив куда нужно\n' "$i"
@@ -1155,9 +1155,11 @@ share_menu() {  # архив
   eval "key=\${$key}"
   case "$key" in
     codex|claude) ai_fix "$key" ;;
-    # Telegram для macOS не принимает файлы через «открыть в программе» — передаём через буфер
-    tg)     if copy_file "$zip"; then open -a "$tg"; say "💬 Telegram открыт, архив в буфере обмена: откройте нужный чат и нажмите ⌘V, затем Enter."
-            else open -R "$zip"; open -a "$tg"; say "Не удалось скопировать — открыл Finder и Telegram: перетащите архив в чат."; fi ;;
+    # Telegram для macOS не принимает файлы ни через «открыть в программе», ни надёжно через ⌘V.
+    # Надёжно — перетаскивание: выделяем архив в Finder и открываем Telegram рядом.
+    tg)     open -R "$zip"; open -a "$tg"; copy_file "$zip"
+            say "💬 Открыл Telegram и Finder с выделенным архивом."
+            say "   Перетащите архив мышкой из окна Finder в нужный чат Telegram и нажмите «Отправить»." ;;
     mail)   open -a "$mail" "$zip" && say "✉️  Письмо создано: впишите адрес и нажмите «Отправить»." ;;
     clip)   if copy_file "$zip"; then say "📋 Архив скопирован. Откройте нужный чат и нажмите ⌘V."
             else open -R "$zip"; say "Скопировать не удалось — открыл Finder, перетащите архив."; fi ;;
