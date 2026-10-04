@@ -1,9 +1,11 @@
 #!/bin/bash
 # Загрузчик amnezia-doctor: скачивает пакет скриптов с GitHub во временную папку и запускает проверку.
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh) root@IP
+#   bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh)
 #
-# Версию можно закрепить: AMNEZIA_DOCTOR_REF=v1.0.0 bash <(curl -fsSL …/run.sh) root@IP
+# Без аргументов скрипт сам спросит адрес сервера. Можно сразу: … run.sh) root@IP
+#
+# Версию можно закрепить: AMNEZIA_DOCTOR_REF=v1.1.0 bash <(curl -fsSL …/run.sh) root@IP
 set -euo pipefail
 
 REPO="ZhdanDesign/amnezia-doctor"

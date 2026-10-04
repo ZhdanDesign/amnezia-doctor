@@ -7,11 +7,28 @@
 ## Запуск на любом Mac
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh) root@IP_СЕРВЕРА
+bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh)
 ```
 
+Скрипт спросит:
+
+1. IP или домен сервера Amnezia
+2. пользователя SSH — по умолчанию `root`
+3. порт SSH — по умолчанию `22`
+4. файл конфига клиента для сверки с сервером — можно пропустить Enter
+
+Ключ не спрашивается: `ssh` сам берёт ключи из `~/.ssh` и ssh-agent. Если сервер просит пароль —
+вводится один раз. Адрес, пользователь и порт запоминаются в `~/.config/amnezia-doctor/last`,
+при следующем запуске достаточно нажимать Enter. Секреты не сохраняются.
+
 Команда скачивает пакет скриптов во временную папку, запускает проверку и удаляет пакет.
-Ничего не устанавливает. Пароль SSH, если нужен, вводится один раз.
+Ничего не устанавливает.
+
+Без вопросов, сразу с адресом:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh) root@IP_СЕРВЕРА
+```
 
 С ключом и клиентским конфигом для сверки с сервером:
 
@@ -30,13 +47,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/m
 | | |
 |---|---|
 | `-p ПОРТ` | порт SSH, по умолчанию 22 |
-| `-i КЛЮЧ` | приватный SSH-ключ |
+| `-i КЛЮЧ` | нестандартный SSH-ключ; обычно не нужен — ssh берёт ключи из `~/.ssh` сам |
 | `-c ФАЙЛ` | клиентский конфиг: `.conf` или ключ `vpn://` |
 | `-o ПАПКА` | куда сложить результат, по умолчанию `~/Desktop` |
 | `--no-probe` | не проверять доставку UDP до сервера |
 | `--analyze ПАПКА` | пересобрать отчёт из готового `facts.txt`, без сети |
 
-Закрепить версию: `AMNEZIA_DOCTOR_REF=v1.0.0 bash <(curl -fsSL …/run.sh) root@IP`.
+Закрепить версию: `AMNEZIA_DOCTOR_REF=v1.1.0 bash <(curl -fsSL …/run.sh) root@IP`.
 
 ## Что проверяется
 
