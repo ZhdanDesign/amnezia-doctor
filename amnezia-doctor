@@ -14,43 +14,37 @@
 set -o pipefail
 export LC_ALL=C
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCHEMA="amnezia-doctor/1"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="$SELF_DIR/lib"
 
 usage() {
   cat <<'EOF'
-amnezia-doctor — диагностика подключения к Amnezia (AmneziaWG / WireGuard / Amnezia в Docker)
+amnezia-doctor — почему на этом Mac не работает Amnezia
 
-Использование:
-  amnezia-doctor                         — спросит адрес сервера, пользователя и порт
-  amnezia-doctor [параметры] пользователь@сервер
+Запуск:
+  amnezia-doctor              проверить Mac: туннель, DNS, MTU, прокси, файрвол, другие VPN
+  amnezia-doctor IP_СЕРВЕРА   то же плюс сеть до сервера и сам сервер (SSH по ключу из ~/.ssh)
 
-Параметры:
-  -p ПОРТ        порт SSH (по умолчанию 22)
-  -i КЛЮЧ        приватный SSH-ключ
-  -c ФАЙЛ        клиентский конфиг: .conf или файл с ключом vpn://  (сверка с сервером)
-  -o ПАПКА       куда сложить результат (по умолчанию ~/Desktop)
-  --no-probe     не проверять доставку UDP-пакетов до сервера
-  --analyze ПАПКА  пересобрать отчёт из готового facts.txt (без сети)
-  -V             версия
-  -h             справка
+Перед запуском включите VPN в Amnezia — главное проверяется при подключённом VPN.
+Ничего не спрашивает, ничего не устанавливает, настройки и ключи Amnezia не читает.
 
-Примеры:
-  amnezia-doctor root@203.0.113.10
-  amnezia-doctor -i ~/.ssh/id_ed25519 -c ~/Downloads/mac.conf root@203.0.113.10
-
-SSH-ключ берётся из ~/.ssh и ssh-agent автоматически, -i нужен только для нестандартного ключа.
-Пароль SSH, если сервер его спросит, вводится один раз — дальше соединение переиспользуется.
-Последний введённый адрес запоминается в ~/.config/amnezia-doctor/last.
+Дополнительно:
+  -p ПОРТ          порт SSH сервера (по умолчанию 22)
+  -i КЛЮЧ          нестандартный SSH-ключ
+  -c ФАЙЛ          сверить с сервером конфиг клиента (.conf или ключ vpn://)
+  -o ПАПКА         куда сложить результат (по умолчанию ~/Desktop)
+  --no-probe       не проверять доставку UDP до сервера
+  --analyze ПАПКА  пересобрать отчёт из готового facts.txt
+  -V | -h          версия | справка
 EOF
 }
 
-TARGET=""; SSH_PORT=22; PORT_SET=0; SSH_KEY=""; CLIENT_CFG=""; OUT_BASE=""; DO_PROBE=1; ANALYZE_DIR=""
+TARGET=""; SSH_PORT=22; SSH_KEY=""; CLIENT_CFG=""; OUT_BASE=""; DO_PROBE=1; ANALYZE_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -p) SSH_PORT="$2"; PORT_SET=1; shift 2 ;;
+    -p) SSH_PORT="$2"; shift 2 ;;
     -i) SSH_KEY="$2"; shift 2 ;;
     -c) CLIENT_CFG="$2"; shift 2 ;;
     -o) OUT_BASE="$2"; shift 2 ;;
@@ -113,26 +107,21 @@ collect_client() {
   setf C_UTUN_COUNT "$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -c '^utun')"
   setf C_IPV6_GLOBAL "$(ifconfig 2>/dev/null | awk '$1=="inet6" && $2 !~ /^fe80/ && $2 != "::1" {c++} END{print c+0}')"
 
-  setf C_HTTP_1111 "$(http_code https://1.1.1.1/)"
-  setf C_DNS_RESOLVE "$(to 10 dscacheutil -q host -a name one.one.one.one 2>/dev/null | grep -q ip_address && echo yes || echo no)"
-  local pub
-  pub="$(to 10 curl -s -m 8 https://api.ipify.org 2>/dev/null)"
-  printf '%s' "$pub" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || pub="$(to 10 curl -s -m 8 https://ifconfig.me/ip 2>/dev/null)"
-  printf '%s' "$pub" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || pub=""
-  setf C_PUBLIC_IP "$pub"
-
   setf C_DNS_SERVERS "$(scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/{print $3}' | awk '!s[$0]++' | head -n 4 | tr '\n' ' ')"
   setf C_PROXY "$(scutil --proxy 2>/dev/null | awk '($1=="HTTPEnable"||$1=="HTTPSEnable"||$1=="SOCKSEnable"||$1=="ProxyAutoConfigEnable") && $3=="1" {sub(/Enable$/, "", $1); print $1}' | sort | tr '\n' ' ')"
   setf C_FIREWALL "$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -q enabled && echo enabled || echo disabled)"
 
   step "Mac: VPN-приложения"
-  local procs
-  procs="$(ps -axo comm= 2>/dev/null | awk -F/ '{print tolower($NF)}' \
-    | grep -E 'amnezia|happ|v2ray|xray|sing-box|singbox|clash|mihomo|nekoray|nekobox|hiddify|streisand|foxray|outline|wireguard|tunnelblick|openvpn|nordvpn|expressvpn|protonvpn|surfshark|warp|tailscale|zerotier|karing|shadowrocket' \
-    | grep -v widget | sort -u | tr '\n' ' ')"
+  local procs re='amnezia|happ|v2ray|xray|sing-box|singbox|clash|mihomo|nekoray|nekobox|hiddify|streisand|foxray|outline|wireguard|tunnelblick|openvpn|nordvpn|expressvpn|protonvpn|surfshark|warp|tailscale|zerotier|karing|shadowrocket|tun2socks|ck-client'
+  procs="$(ps -axo comm= 2>/dev/null | awk -F/ '{print tolower($NF)}' | grep -E "$re" | grep -v widget | sort -u | tr '\n' ' ')"
   setf C_VPN_PROCS "$procs"
-  setf C_OTHER_VPN_PROCS "$(printf '%s' "$procs" | tr ' ' '\n' | grep -v amnezia | grep -v '^$' | tr '\n' ' ')"
+  # чужие — те, что запущены не из бандла AmneziaVPN.app (Amnezia сама запускает xray, openvpn, tun2socks)
+  setf C_OTHER_VPN_PROCS "$(ps -axo comm= 2>/dev/null | grep -v 'AmneziaVPN.app/' | awk -F/ '{print tolower($NF)}' \
+    | grep -E "$re" | grep -v widget | grep -v amnezia | sort -u | tr '\n' ' ')"
   setf C_AMNEZIA_RUNNING "$(printf '%s' "$procs" | grep -q amnezia && echo yes || echo no)"
+  # сторонние файрволы исходящего трафика часто молча блокируют VPN-движок
+  setf C_FW_APPS "$(ps -axo comm= 2>/dev/null | awk -F/ '{print tolower($NF)}' \
+    | grep -E 'lulu|little ?snitch|radio ?silence|murus|vallum|handsoff' | sort -u | tr '\n' ' ')"
 
   local app="" p
   for p in /Applications/AmneziaVPN.app "$HOME/Applications/AmneziaVPN.app" /Applications/*[Aa]mnezia*.app; do
@@ -175,6 +164,147 @@ EOF
   scutil --proxy 2>/dev/null > "$RAW/client/proxy.txt"
 }
 
+# ================================================================ сбор: туннель Amnezia на Mac
+#
+# Настройки и ключи приложения не читаются. Всё видно со стороны системы: интерфейс utun,
+# маршруты, счётчики байт сокета VPN-движка (зашифрованный трафик до сервера) и интерфейса
+# туннеля (расшифрованный трафик) до и после тестового трафика.
+
+utun_counters() {  # utunN → "ipkts ibytes opkts obytes"
+  netstat -I "$1" -b 2>/dev/null | awk 'NR==2 {
+    for (i = 1; i <= NF; i++) if ($i ~ /^<Link#/) break
+    j = i + 1; if ($j ~ /:/) j++
+    print $j, $(j+2), $(j+3), $(j+5) }'
+}
+
+sock_counters() {  # процесс → "rxbytes txbytes" по всем его сокетам
+  if [ -z "$1" ]; then echo "0 0"; return; fi
+  netstat -anv 2>/dev/null | awk -v p="$1" '
+    { for (i = 5; i <= NF; i++) if (index($i, p ":") == 1) { rx += $(i-4); tx += $(i-3) } }
+    END { printf "%d %d\n", rx, tx }'
+}
+
+ping_loss() {  # вывод ping → процент потерь (целое)
+  local l; l="$(sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' | cut -d. -f1)"
+  isnum "$l" && printf '%s' "$l" || printf '100'
+}
+
+collect_tunnel() {
+  step "Mac: VPN-туннель Amnezia"
+  setf T_PRESENT yes
+  local procs eng="" engp="" list="" t a tif phys log="$RAW/client/active_tests.txt"
+  procs=" $(getf C_VPN_PROCS) "
+  case "$procs" in
+    *" amneziawg-go "*) eng=amneziawg; engp=amneziawg-go ;;
+    *" wireguard-go "*) eng=wireguard; engp=wireguard-go ;;
+    *" xray "*)         eng=xray;      engp=xray ;;
+    *" openvpn "*)      eng=openvpn;   engp=openvpn ;;
+    *" ck-client "*)    eng=cloak;     engp=ck-client ;;
+  esac
+  setf T_ENGINE "$eng"
+  setf T_ENGINE_PROC "$engp"
+
+  for t in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun'); do
+    a="$(ifconfig "$t" 2>/dev/null | awk '$1=="inet"{print $2; exit}')"
+    [ -n "$a" ] && list="$list $t:$a"
+  done
+  setf T_UTUN_V4 "$list"
+  tif="$(netstat -rn -f inet 2>/dev/null | awk '($1=="0/1" || $1=="default") && $NF ~ /^utun/ {print $NF; exit}')"
+  [ -z "$tif" ] && tif="$(printf '%s' "$list" | awk '{split($1, a, ":"); print a[1]}')"
+  setf T_IF "$tif"
+  phys="$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $NF !~ /^(utun|bridge|lo|awdl|llw)/ {print $NF; exit}')"
+  setf T_PHYS_IF "$phys"
+  setf T_EXCL_COUNT "$(netstat -rn -f inet 2>/dev/null | awk -v p="$phys" 'p != "" && $NF==p && $1 ~ /\/32$/ {c++} END{print c+0}')"
+  if [ -n "$tif" ]; then
+    setf T_IF_ADDR "$(ifconfig "$tif" 2>/dev/null | awk '$1=="inet"{print $2; exit}')"
+    setf T_IF_MTU "$(ifconfig "$tif" 2>/dev/null | awk '/mtu/{print $NF; exit}')"
+    setf T_ROUTES_VIA_IF "$(netstat -rn -f inet 2>/dev/null | awk -v t="$tif" '$NF==t {c++} END{print c+0}')"
+    setf T_FULL_TUNNEL "$(netstat -rn -f inet 2>/dev/null | awk -v t="$tif" '
+      $NF==t && $1=="default" {d=1} $NF==t && $1=="0/1" {l=1} $NF==t && $1=="128.0/1" {h=1}
+      END {print (d || (l && h)) ? "yes" : "no"}')"
+    setf T_V6_TUNNELED "$(netstat -rn -f inet6 2>/dev/null | awk -v t="$tif" '$NF==t && ($1=="::/1" || $1=="8000::/1" || $1=="default") {f=1} END{print f ? "yes" : "no"}')"
+  fi
+
+  step "Mac: тестовый трафик (около 30 секунд)"
+  local s0 s1 u0="0 0 0 0" u1="0 0 0 0" out trace r mtu big
+  s0="$(sock_counters "$engp")"
+  [ -n "$tif" ] && u0="$(utun_counters "$tif")"
+  : > "$log"
+
+  out="$(to 15 ping -c 5 -i 0.5 -t 8 1.1.1.1 2>&1)"
+  printf '### ping 1.1.1.1\n%s\n\n' "$out" >> "$log"
+  setf A_PING_LOSS "$(printf '%s\n' "$out" | ping_loss)"
+
+  trace="$(to 12 curl -s -m 8 https://1.1.1.1/cdn-cgi/trace 2>&1)"
+  printf '### https://1.1.1.1/cdn-cgi/trace\n%s\n\n' "$trace" >> "$log"
+  if printf '%s\n' "$trace" | grep -q '^ip='; then setf A_HTTP_IP ok; else setf A_HTTP_IP fail; fi
+  setf A_EXIT_IP "$(printf '%s\n' "$trace" | sed -n 's/^ip=//p')"
+  setf A_EXIT_LOC "$(printf '%s\n' "$trace" | sed -n 's/^loc=//p')"
+
+  if command -v dig >/dev/null 2>&1; then
+    out="$(to 10 dig +time=3 +tries=1 +short @1.1.1.1 example.com A 2>&1)"
+    printf '### dig @1.1.1.1 example.com\n%s\n\n' "$out" >> "$log"
+    if printf '%s\n' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then setf A_DNS_DIRECT ok; else setf A_DNS_DIRECT fail; fi
+  fi
+  out="$(to 10 dscacheutil -q host -a name www.google.com 2>&1)"
+  printf '### системный DNS: www.google.com\n%s\n\n' "$out" >> "$log"
+  if printf '%s\n' "$out" | grep -q ip_address; then setf A_DNS_SYSTEM ok; else setf A_DNS_SYSTEM fail; fi
+
+  r="$(http_code https://www.google.com/generate_204)"
+  printf '### https://www.google.com/generate_204 → %s\n\n' "$r" >> "$log"
+  setf A_HTTP_NAME "$r"
+
+  mtu="$(getf T_IF_MTU)"; isnum "$mtu" || mtu="$(getf C_DEFAULT_IF_MTU)"
+  out="$(to 12 ping -D -c 2 -t 6 -s 1172 1.1.1.1 2>&1)"
+  printf '### ping DF 1200 байт\n%s\n\n' "$out" >> "$log"
+  if [ "$(printf '%s\n' "$out" | ping_loss)" -lt 100 ]; then setf A_MTU_SMALL ok; else setf A_MTU_SMALL fail; fi
+  if isnum "$mtu" && [ "$mtu" -gt 1228 ]; then
+    big=$((mtu - 28))
+    out="$(to 12 ping -D -c 2 -t 6 -s "$big" 1.1.1.1 2>&1)"
+    printf '### ping DF %s байт (MTU интерфейса)\n%s\n\n' "$mtu" "$out" >> "$log"
+    if [ "$(printf '%s\n' "$out" | ping_loss)" -lt 100 ]; then setf A_MTU_FULL ok; else setf A_MTU_FULL fail; fi
+    setf A_MTU_FULL_SIZE "$mtu"
+  fi
+
+  r="$(to 25 curl -s -o /dev/null -m 20 -w '%{http_code} %{size_download} %{speed_download}' 'https://speed.cloudflare.com/__down?bytes=1000000' 2>/dev/null)"
+  printf '### загрузка 1 МБ: код размер скорость\n%s\n\n' "$r" >> "$log"
+  set -- $r
+  setf A_BULK_CODE "${1:-000}"
+  setf A_BULK_BYTES "${2:-0}"
+  setf A_BULK_BPS "${3%%.*}"
+
+  if [ -n "$tif" ] && [ -n "$phys" ]; then
+    out="$(to 10 curl -s -m 6 --interface "$phys" https://1.1.1.1/cdn-cgi/trace 2>&1)"
+    printf '### мимо туннеля через %s\n%s\n\n' "$phys" "$out" >> "$log"
+    if printf '%s\n' "$out" | grep -q '^ip='; then setf A_PHYS_HTTP ok; else setf A_PHYS_HTTP fail; fi
+  fi
+
+  sleep 1
+  s1="$(sock_counters "$engp")"
+  [ -n "$tif" ] && u1="$(utun_counters "$tif")"
+  printf '### счётчики: сокет %s (rx tx) до=%s после=%s; %s (ipkts ibytes opkts obytes) до=%s после=%s\n' \
+    "$engp" "$s0" "$s1" "$tif" "$u0" "$u1" >> "$log"
+  set -- $s0 $s1
+  if [ -n "$engp" ] && [ "$(( $3 + $4 ))" -gt 0 ]; then
+    setf T_SOCK_SEEN yes
+    setf T_D_SOCK_RX "$(( $3 - $1 ))"
+    setf T_D_SOCK_TX "$(( $4 - $2 ))"
+  else
+    setf T_SOCK_SEEN no
+  fi
+  set -- $u0 $u1
+  if [ -n "$tif" ]; then
+    setf T_D_IF_IN_PKTS "$(( $5 - $1 ))"
+    setf T_D_IF_IN_BYTES "$(( $6 - $2 ))"
+    setf T_D_IF_OUT_PKTS "$(( $7 - $3 ))"
+  fi
+
+  # совместимость с проверками сервера и старыми отчётами
+  setf C_PUBLIC_IP "$(getf A_EXIT_IP)"
+  if [ "$(getf A_HTTP_IP)" = ok ]; then setf C_HTTP_1111 200; else setf C_HTTP_1111 000; fi
+  if [ "$(getf A_DNS_SYSTEM)" = ok ]; then setf C_DNS_RESOLVE yes; else setf C_DNS_RESOLVE no; fi
+}
+
 # ================================================================ сбор: клиентский конфиг
 
 collect_client_cfg() {
@@ -215,9 +345,9 @@ collect_network() {
 
 collect_server() {
   [ "$(getf N_SSH_TCP)" = ok ] || { setf N_SSH_AUTH skipped; return; }
-  step "SSH: вход на $TARGET (пароль, если спросят, вводится один раз)"
+  step "SSH: вход на $TARGET по ключу из ~/.ssh"
   SSH_BASE=(-p "$SSH_PORT" -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3
-            -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR
+            -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o BatchMode=yes
             -o ControlMaster=auto -o "ControlPath=$CTL/%C" -o ControlPersist=300)
   [ -n "$SSH_KEY" ] && SSH_BASE+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
 
@@ -305,7 +435,110 @@ add() {
     "$(printf '%s' "$3" | oneline)" "$(printf '%s' "$4" | oneline)" "$(printf '%s' "$5" | oneline)" >> "$FIND"
 }
 
+tunnel_dead() {  # туннель есть, но по IP интернет через него не открывается
+  [ -n "$(getf T_IF)" ] && [ "$(getf A_HTTP_IP)" = fail ]
+}
+
+an_tunnel() {
+  [ "$(getf T_PRESENT)" = yes ] || return
+  local tif eng app run ks_note="" d_rx d_tx d_in d_out xip loc srv hijack=0
+  tif="$(getf T_IF)"; eng="$(getf T_ENGINE)"; app="$(getf C_AMNEZIA_APP)"; run="$(getf C_AMNEZIA_RUNNING)"
+
+  if [ -z "$tif" ]; then
+    if [ "$app" = absent ]; then
+      add FAIL TUN01 "На Mac не установлено приложение AmneziaVPN" "" \
+        "Скачайте AmneziaVPN с amnezia.org, добавьте сервер по ключу от администратора, подключитесь и запустите проверку ещё раз."
+    elif [ "$run" != yes ]; then
+      add FAIL TUN01 "Приложение AmneziaVPN не запущено" "версия: $(getf C_AMNEZIA_APP_VERSION)" \
+        "Откройте AmneziaVPN, нажмите «Подключиться» и запустите проверку ещё раз — главное проверяется при включённом VPN."
+    else
+      add FAIL TUN02 "AmneziaVPN открыта, но VPN не подключён" "VPN-интерфейса с адресом нет; процессы: $(getf C_VPN_PROCS)" \
+        "Нажмите «Подключиться» в Amnezia и запустите проверку ещё раз. Если подключение не устанавливается или сразу рвётся — запустите проверку с IP сервера: она покажет, доступен ли сервер из этой сети."
+    fi
+    if [ "$(getf A_HTTP_IP)" = fail ]; then
+      add FAIL CLI01 "У Mac нет интернета даже без VPN" "https://1.1.1.1: нет ответа; ping: потери $(getf A_PING_LOSS)%" \
+        "VPN тут ни при чём: проверьте Wi-Fi или кабель, перезагрузите роутер."
+    fi
+    return
+  fi
+
+  add OK TUN00 "VPN-туннель поднят: $tif, адрес $(getf T_IF_ADDR), MTU $(getf T_IF_MTU)" \
+    "движок: ${eng:-не определён}; весь трафик через VPN: $(getf T_FULL_TUNNEL); сайтов в обход VPN: $(getf T_EXCL_COUNT)" ""
+
+  local others
+  others="$(printf '%s' "$(getf T_UTUN_V4)" | tr ' ' '\n' | grep -v "^$tif:" | grep -v '^$' | tr '\n' ' ')"
+  [ -n "$others" ] && add WARN TUN03 "Кроме Amnezia поднят ещё один VPN-туннель: $others" "процессы чужих VPN: $(getf C_OTHER_VPN_PROCS)" \
+    "Два VPN одновременно спорят за маршруты. Отключите второй VPN (Happ, v2ray, Outline, корпоративный и т.п.) и переподключите Amnezia."
+
+  if [ -n "$(getf C_ROUTE_1111_IF)" ] && [ "$(getf C_ROUTE_1111_IF)" != "$tif" ]; then
+    hijack=1
+    add FAIL TUN04 "Туннель поднят, но интернет идёт мимо него — через $(getf C_ROUTE_1111_IF)" "маршрутов через $tif: $(getf T_ROUTES_VIA_IF); весь трафик через VPN: $(getf T_FULL_TUNNEL)" \
+      "Скорее всего, маршруты перехватил другой VPN — отключите его. Либо в Amnezia включено раздельное туннелирование «через VPN только выбранные сайты»: выключите его в настройках."
+  fi
+
+  [ "$(getf A_PHYS_HTTP)" = fail ] && ks_note=" Пока VPN включён, kill switch Amnezia блокирует интернет мимо туннеля — поэтому интернета нет совсем. Чтобы временно вернуть интернет, отключите VPN в Amnezia."
+  d_rx="$(getf T_D_SOCK_RX)"; d_tx="$(getf T_D_SOCK_TX)"; d_in="$(getf T_D_IF_IN_PKTS)"; d_out="$(getf T_D_IF_OUT_PKTS)"
+
+  if tunnel_dead; then
+    if [ "$(getf T_SOCK_SEEN)" = yes ] && isnum "$d_tx" && isnum "$d_rx"; then
+      if [ "$d_tx" -eq 0 ]; then
+        add FAIL TUN09 "Туннель есть, но Amnezia не отправляет пакеты на сервер" "за время теста к серверу ушло 0 байт" \
+          "Переподключитесь в Amnezia. Не помогло — закройте приложение полностью и откройте снова, затем перезагрузите Mac.$ks_note"
+      elif [ "$d_rx" -eq 0 ]; then
+        add FAIL TUN05 "Mac отправляет пакеты на сервер, но ответов нет" "к серверу ушло $d_tx Б, от сервера пришло 0 Б" \
+          "1) Раздайте интернет с телефона и подключитесь через него: если так работает — провайдер этой сети блокирует VPN. 2) Если не работает нигде — сервер выключен или VPN на нём остановлен: запустите проверку с IP сервера. 3) Удалите сервер в Amnezia и добавьте заново по свежему ключу.$ks_note"
+      elif isnum "$d_in" && [ "$d_in" -eq 0 ] && [ "$d_rx" -gt 1500 ]; then
+        add FAIL TUN06 "Сервер отвечает, но Mac не может принять ответы — подключение настроено не так, как сервер" "от сервера пришло $d_rx Б, в туннель попало 0 пакетов" \
+          "Ключ подключения устарел или не совпадает с сервером (например, сервер переустанавливали). Удалите сервер в Amnezia и добавьте заново по свежему ключу от администратора. Обновите приложение Amnezia.$ks_note"
+      else
+        add FAIL TUN07 "Связь с сервером есть, но сервер не выпускает трафик в интернет" "от сервера пришло $d_rx Б (служебные пакеты), ответов из интернета нет" \
+          "Проблема на сервере: не настроен выход в интернет (NAT или IP-форвардинг). Запустите проверку с IP сервера — она покажет причину. Администратору: перезагрузить сервер или переустановить протокол в Amnezia.$ks_note"
+      fi
+    elif isnum "$d_out" && [ "$d_out" -gt 0 ] && isnum "$d_in" && [ "$d_in" -eq 0 ]; then
+      add FAIL TUN05 "Пакеты уходят в VPN-туннель, ответов нет" "из туннеля ушло $d_out пакетов, пришло 0" \
+        "1) Раздайте интернет с телефона и подключитесь через него: если так работает — провайдер этой сети блокирует VPN. 2) Если не работает нигде — запустите проверку с IP сервера. 3) Удалите сервер в Amnezia и добавьте заново.$ks_note"
+    else
+      add FAIL TUN08 "VPN подключён, но интернета через него нет" "https://1.1.1.1 через туннель: нет ответа" \
+        "Переподключитесь в Amnezia. Не помогло — запустите проверку с IP сервера.$ks_note"
+    fi
+    return
+  fi
+
+  xip="$(getf A_EXIT_IP)"; loc="$(getf A_EXIT_LOC)"
+  [ "$hijack" = 1 ] || add OK TUN10 "Интернет через VPN работает: выход в сеть через $xip${loc:+ ($loc)}" "ping: потери $(getf A_PING_LOSS)%; пакетов из туннеля: $d_in" ""
+  srv="$(getf N_TARGET_IP)"
+  if [ -n "$srv" ] && [ -n "$xip" ] && [ "$xip" != "$srv" ]; then
+    add INFO TUN11 "Amnezia выходит в интернет через $xip, а проверяется сервер $srv" "" \
+      "Если в Amnezia несколько серверов — возможно, подключён не тот. Выберите нужный и запустите проверку снова. У некоторых хостеров адрес выхода отличается от адреса сервера — тогда всё в порядке."
+  fi
+
+  local hn
+  hn="$(getf A_HTTP_NAME)"
+  if [ "$(getf A_DNS_SYSTEM)" = fail ] || [ "$hn" = 000 ]; then
+    add FAIL DNS01 "VPN работает, но не открываются сайты по именам — сломан DNS" "по IP: работает; www.google.com: ${hn}; DNS 1.1.1.1 напрямую: $(getf A_DNS_DIRECT); DNS-серверы: $(getf C_DNS_SERVERS)" \
+      "В Amnezia → Настройки → Соединение → DNS укажите 1.1.1.1 и 8.8.8.8 и переподключитесь. Отключите AdGuard, NextDNS и подобные приложения; в Системных настройках → VPN и фильтры удалите DNS-профили; выключите iCloud Private Relay."
+  fi
+  if [ "$(getf A_MTU_SMALL)" = ok ] && [ "$(getf A_MTU_FULL)" = fail ]; then
+    add FAIL MTU01 "Большие пакеты в туннеле теряются (MTU): часть сайтов не грузится" "1200 байт: проходит; $(getf A_MTU_FULL_SIZE) байт: теряется" \
+      "В Amnezia откройте настройки протокола сервера (AmneziaWG), поставьте MTU = 1280, сохраните и переподключитесь."
+  elif [ "$(getf A_BULK_CODE)" != 200 ] && [ "$hn" != 000 ]; then
+    add FAIL MTU02 "Мелкие запросы проходят, а загрузка 1 МБ обрывается" "загрузка: код $(getf A_BULK_CODE), получено $(getf A_BULK_BYTES) Б" \
+      "Типичный признак проблемы с MTU. В Amnezia → настройки протокола → MTU = 1280, сохраните и переподключитесь."
+  elif isnum "$(getf A_BULK_BPS)" && [ "$(getf A_BULK_BPS)" -lt 125000 ]; then
+    add WARN SPD01 "Очень низкая скорость через VPN: $(( $(getf A_BULK_BPS) * 8 / 1000 )) Кбит/с" "1 МБ за тест" \
+      "Сравните с мобильным интернетом. Если везде медленно — сервер перегружен или далеко; если только в этой сети — провайдер замедляет VPN."
+  fi
+
+  [ "$(getf A_PHYS_HTTP)" = fail ] && add INFO KS01 "Включён kill switch: мимо VPN интернет не ходит" "" \
+    "Это защита. Если VPN отвалится — интернета не будет, пока не отключите VPN в Amnezia."
+  if isnum "$(getf C_IPV6_GLOBAL)" && [ "$(getf C_IPV6_GLOBAL)" -gt 0 ] && [ "$(getf T_V6_TUNNELED)" != yes ]; then
+    add WARN V601 "IPv6-трафик идёт мимо VPN" "у Mac есть IPv6-адреса, маршрута IPv6 через $tif нет" \
+      "Часть сайтов откроется без VPN, а заблокированные — нет. Отключите IPv6: Системные настройки → Wi-Fi → Подробнее → TCP/IP → Настроить IPv6: «Только локальная связь»."
+  fi
+}
+
 an_network() {
+  [ -n "$(getf N_TARGET_HOST)" ] || return
   local host tip sshp ping tcp
   host="$(getf N_TARGET_HOST)"; tip="$(getf N_TARGET_IP)"; sshp="$(getf N_SSH_PORT)"
   if [ -z "$tip" ]; then
@@ -314,6 +547,14 @@ an_network() {
     return
   fi
   ping="$(getf N_PING)"; tcp="$(getf N_SSH_TCP)"
+  case "$(getf C_ROUTE_TO_TARGET_IF)" in
+    utun*)
+      if tunnel_dead; then
+        add INFO NET06 "Доступность сервера $tip не проверить: путь к нему идёт через неработающий туннель" "маршрут к серверу: $(getf C_ROUTE_TO_TARGET_IF)" \
+          "Сначала устраните неисправность туннеля выше. Чтобы проверить сам сервер, отключите VPN в Amnezia и запустите проверку ещё раз."
+        return
+      fi ;;
+  esac
   case "$ping/$tcp" in
     fail/fail) add FAIL NET02 "Сервер недоступен из этой сети: нет ни ping, ни TCP/$sshp" \
       "ping $tip: потери $(getf N_PING_LOSS)%; TCP $tip:$sshp: нет соединения; маршрут через $(getf C_ROUTE_TO_TARGET_IF)" \
@@ -339,7 +580,7 @@ an_ssh() {
         *"IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*) rec="Сервер переустановлен, сменился ключ хоста. Выполните: ssh-keygen -R $tip — и запустите диагностику снова." ;;
         *"timed out"*|*"Connection refused"*|*"Connection closed"*) rec="SSH обрывает соединение: проверьте порт, файрвол, не забанен ли ваш IP через fail2ban (проверка с другой сети)." ;;
       esac
-      add FAIL SSH01 "SSH-вход не удался" "$err" "$rec" ;;
+      add WARN SSH01 "Сервер не проверен: SSH-вход не удался" "$err" "$rec Проверка Mac выполнена полностью и без этого." ;;
   esac
 }
 
@@ -599,18 +840,20 @@ an_config() {
 }
 
 an_client() {
-  [ "$(getf C_HTTP_1111)" = 000 ] && add FAIL CLI01 "У Mac нет доступа в интернет" "curl https://1.1.1.1: нет ответа" \
+  [ "$(getf T_PRESENT)" != yes ] && [ "$(getf C_HTTP_1111)" = 000 ] && add FAIL CLI01 "У Mac нет доступа в интернет" "curl https://1.1.1.1: нет ответа" \
     "Проверьте Wi-Fi или кабель. Если включён VPN — выключите его и повторите: возможно, сломан именно он."
-  [ "$(getf C_DNS_RESOLVE)" = no ] && add WARN CLI02 "На Mac не работает DNS" "DNS: $(getf C_DNS_SERVERS)" \
+  [ "$(getf T_PRESENT)" != yes ] && [ "$(getf C_DNS_RESOLVE)" = no ] && add WARN CLI02 "На Mac не работает DNS" "DNS: $(getf C_DNS_SERVERS)" \
     "Если включён VPN — проверьте строку DNS в конфиге. Без VPN — настройки сети."
   [ -n "$(getf C_OTHER_VPN_PROCS)" ] && add WARN CLI03 "Запущены другие VPN или прокси: $(getf C_OTHER_VPN_PROCS)" "utun-интерфейсов: $(getf C_UTUN_COUNT)" \
     "Закройте их на время работы Amnezia: они перехватывают маршруты и DNS."
   [ -n "$(getf C_PROXY)" ] && add WARN CLI04 "Включён системный прокси: $(getf C_PROXY)" "" \
     "Системные настройки → Сеть → Подробнее → Прокси: выключите, если не нужен."
-  [ "$(getf C_AMNEZIA_APP)" = absent ] && add INFO CLI05 "Приложение AmneziaVPN не найдено в /Applications" "" \
+  [ "$(getf T_PRESENT)" != yes ] && [ "$(getf C_AMNEZIA_APP)" = absent ] && add INFO CLI05 "Приложение AmneziaVPN не найдено в /Applications" "" \
     "Установите с amnezia.org, если подключаетесь им."
+  [ -n "$(getf C_FW_APPS)" ] && add WARN CLI09 "Запущен сторонний файрвол: $(getf C_FW_APPS)" "" \
+    "Такие программы могут молча блокировать VPN-движок Amnezia. Разрешите в нём AmneziaVPN, amneziawg-go и AmneziaVPN-service или временно отключите его и проверьте снова."
   case "$(getf C_ROUTE_TO_TARGET_IF)" in
-    utun*) add INFO CLI06 "Трафик к серверу идёт через VPN-интерфейс $(getf C_ROUTE_TO_TARGET_IF)" "VPN-процессы: $(getf C_VPN_PROCS)" \
+    utun*) [ "$(getf T_PRESENT)" = yes ] || add INFO CLI06 "Трафик к серверу идёт через VPN-интерфейс $(getf C_ROUTE_TO_TARGET_IF)" "VPN-процессы: $(getf C_VPN_PROCS)" \
       "Проверки сети описывают путь через этот VPN. Если он подключён к другому серверу, для чистого результата выключите его." ;;
   esac
   if [ -n "$(getf C_PUBLIC_IP)" ] && [ "$(getf C_PUBLIC_IP)" = "$(getf N_TARGET_IP)" ]; then
@@ -632,6 +875,7 @@ an_security() {
 analyze() {
   FIND="$OUT/findings.tsv"
   : > "$FIND"
+  an_tunnel
   an_network
   an_ssh
   if an_server; then
@@ -737,63 +981,16 @@ if [ -n "$ANALYZE_DIR" ]; then
   exit 0
 fi
 
-# ================================================================ интерактивный ввод
-# Без адреса в аргументах спрашиваем у человека. Ключ не спрашиваем: ssh сам берёт ~/.ssh и ssh-agent.
-# Запоминаем только адрес, пользователя и порт — никаких секретов.
-
-STATE="$HOME/.config/amnezia-doctor/last"
-
-state_get() { [ -f "$STATE" ] && awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$STATE"; }
-
-ask() {  # имя_переменной вопрос значение_по_умолчанию
-  local ans
-  if [ -n "$3" ]; then printf '%s [%s]: ' "$2" "$3" > /dev/tty; else printf '%s: ' "$2" > /dev/tty; fi
-  IFS= read -r ans < /dev/tty || ans=""
-  ans="$(printf '%s' "$ans" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-  [ -z "$ans" ] && ans="$3"
-  printf -v "$1" '%s' "$ans"
-}
-
-# путь, перетащенный из Finder или с ~: снимаем кавычки и экранирование пробелов
-clean_path() {
-  local p
-  p="$(printf '%s' "$1" | sed -e "s/^'\(.*\)'\$/\1/" -e 's/^"\(.*\)"$/\1/' -e 's/\\\(.\)/\1/g')"
-  # shellcheck disable=SC2088 # сравниваем буквальную ~ во введённом тексте
-  case "$p" in "~/"*) p="$HOME/${p#\~/}" ;; esac
-  printf '%s' "$p"
-}
-
-if [ -z "$TARGET" ]; then
-  if ! { : < /dev/tty; } 2>/dev/null; then usage >&2; exit 2; fi
-  say "Данные сервера Amnezia. Enter — оставить значение в скобках."
-  host=""
-  while [ -z "$host" ]; do
-    ask host "IP или домен сервера" "$(state_get HOST)"
-    host="${host#*@}"
-  done
-  ask user "Пользователь SSH" "$(state_get USER)"
-  [ -z "$user" ] && user=root
-  if [ "$PORT_SET" != 1 ]; then
-    def_port="$(state_get PORT)"
-    SSH_PORT=""
-    while ! isnum "$SSH_PORT"; do ask SSH_PORT "Порт SSH" "${def_port:-22}"; done
-  fi
-  if [ -z "$CLIENT_CFG" ]; then
-    ask cfg "Файл конфига клиента (.conf или с ключом vpn://) для сверки, Enter — пропустить" ""
-    if [ -n "$cfg" ]; then
-      cfg="$(clean_path "$cfg")"
-      if [ -r "$cfg" ]; then CLIENT_CFG="$cfg"; else say "Файл не найден: $cfg — сверка конфига пропущена."; fi
-    fi
-  fi
-  TARGET="$user@$host"
-  mkdir -p "$(dirname "$STATE")" && ( umask 077; printf 'HOST=%s\nUSER=%s\nPORT=%s\n' "$host" "$user" "$SSH_PORT" > "$STATE" )
-  say "SSH-ключ возьмётся из ~/.ssh и ssh-agent. Если сервер спросит пароль — введите его один раз."
+# Без аргумента проверяется только Mac — этого достаточно, чтобы найти большинство причин.
+# С IP сервера — ещё сеть до сервера и сам сервер (SSH по ключу из ~/.ssh, пароль не спрашивается).
+if [ -n "$TARGET" ]; then
+  case "$TARGET" in *@*) ;; *) TARGET="root@$TARGET" ;; esac
 fi
 HOST="${TARGET#*@}"
 TIP=""
 
 [ -z "$OUT_BASE" ] && { [ -d "$HOME/Desktop" ] && OUT_BASE="$HOME/Desktop" || OUT_BASE="$(pwd)"; }
-NAME="amnezia-doctor_$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9.-' '_')_$(date +%Y%m%d-%H%M%S)"
+NAME="amnezia-doctor_$(printf '%s' "${HOST:-mac}" | tr -c 'A-Za-z0-9.-' '_')_$(date +%Y%m%d-%H%M%S)"
 OUT="$OUT_BASE/$NAME"
 RAW="$OUT/raw"
 mkdir -p "$RAW/client" "$RAW/server" || exit 1
@@ -802,24 +999,27 @@ FACTS="$OUT/facts.txt"
 CTL="$(mktemp -d /tmp/amzd.XXXXXX)"
 SSH_BASE=()
 cleanup() {
-  ssh -o "ControlPath=$CTL/%C" -p "$SSH_PORT" -O exit "$TARGET" >/dev/null 2>&1
+  [ -n "$TARGET" ] && ssh -o "ControlPath=$CTL/%C" -p "$SSH_PORT" -O exit "$TARGET" >/dev/null 2>&1
   rm -rf "$CTL"
 }
 trap cleanup EXIT
 
-say "amnezia-doctor $VERSION → $TARGET"
+say "amnezia-doctor $VERSION → ${TARGET:-только Mac (IP сервера не указан)}"
 say "Результат: $OUT"
 setf META_SCHEMA "$SCHEMA"
 setf META_VERSION "$VERSION"
-setf META_TARGET "$TARGET"
+setf META_TARGET "${TARGET:-только Mac}"
 setf META_STARTED "$(date '+%Y-%m-%d %H:%M:%S %z')"
 setf META_PROBE "$([ "$DO_PROBE" = 1 ] && echo on || echo off)"
 
 collect_client
+collect_tunnel
 collect_client_cfg
-collect_network
-collect_server
-collect_probe
+if [ -n "$TARGET" ]; then
+  collect_network
+  collect_server
+  collect_probe
+fi
 
 step "Анализ"
 normalize_facts

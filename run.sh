@@ -3,9 +3,9 @@
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh)
 #
-# Без аргументов скрипт сам спросит адрес сервера. Можно сразу: … run.sh) root@IP
+# Без аргументов проверяется Mac. С IP сервера — ещё и сервер: … run.sh) IP
 #
-# Версию можно закрепить: AMNEZIA_DOCTOR_REF=v1.1.0 bash <(curl -fsSL …/run.sh) root@IP
+# Версию можно закрепить: AMNEZIA_DOCTOR_REF=v1.2.0 bash <(curl -fsSL …/run.sh)
 set -euo pipefail
 
 REPO="ZhdanDesign/amnezia-doctor"
