@@ -14,7 +14,7 @@
 set -o pipefail
 export LC_ALL=C
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 SCHEMA="amnezia-doctor/1"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="$SELF_DIR/lib"
@@ -1126,6 +1126,28 @@ copy_file() {  # путь → буфер обмена как файл (public.fi
     pb.clearContents; return pb.writeObjects($([$.NSURL.fileURLWithPath(a[0])])) }' "$1" 2>/dev/null | grep -q true
 }
 
+tg_share_id() {  # Telegram.app → bundle id его расширения «Поделиться»
+  local f
+  for f in "$1"/Contents/PlugIns/*.appex/Contents/Info.plist; do
+    [ -f "$f" ] || continue
+    [ "$(plutil -extract NSExtension.NSExtensionPointIdentifier raw -o - "$f" 2>/dev/null)" = com.apple.share-services ] || continue
+    plutil -extract CFBundleIdentifier raw -o - "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# Окно Telegram «Поделиться» с прикреплённым архивом. Расширение по умолчанию выключено — включаем.
+# Вернёт shared | cancelled | timeout | no-service | cannot-perform | no-extension
+tg_share() {  # Telegram.app архив
+  local id r
+  id="$(tg_share_id "$1")" || { echo no-extension; return; }
+  if ! pluginkit -m -i "$id" 2>/dev/null | grep -q '^+'; then
+    pluginkit -e use -i "$id" 2>/dev/null && say "   Включаю Telegram в меню «Поделиться» macOS (отключается в Системных настройках → Расширения)."
+  fi
+  r="$(osascript -l JavaScript "$LIB/share.js" "$2" "$id" 600 2>/dev/null)"
+  echo "${r:-error}"
+}
+
 share_menu() {  # архив
   local zip="$1" tg mail key i=0 acts="" def=""
   { : < /dev/tty; } 2>/dev/null || return 0
@@ -1137,7 +1159,7 @@ share_menu() {  # архив
     i=$((i + 1)); acts="$acts codex"
     printf '  %s) 🤖 Починить с помощью Codex%s\n' "$i" "$([ "$def" = codex ] && printf ' ← Enter')"
     i=$((i + 1)); acts="$acts claude"; printf '  %s) 🤖 Починить с помощью Claude Code\n' "$i"
-    if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — откроются Telegram и Finder: перетащите архив в чат\n' "$i"; fi
+    if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — окно Telegram с прикреплённым архивом: выберите чат и «Отправить»\n' "$i"; fi
     if [ -n "$mail" ]; then i=$((i + 1)); acts="$acts mail"; printf '  %s) ✉️  Почта — новое письмо с архивом во вложении\n' "$i"; fi
     i=$((i + 1)); acts="$acts clip"; printf '  %s) 📋 Скопировать архив — вставьте ⌘V в любой мессенджер (WhatsApp, Telegram, Slack…)\n' "$i"
     i=$((i + 1)); acts="$acts finder"; printf '  %s) 📂 Показать в Finder — перетащите архив куда нужно\n' "$i"
@@ -1155,11 +1177,16 @@ share_menu() {  # архив
   eval "key=\${$key}"
   case "$key" in
     codex|claude) ai_fix "$key" ;;
-    # Telegram для macOS не принимает файлы ни через «открыть в программе», ни надёжно через ⌘V.
-    # Надёжно — перетаскивание: выделяем архив в Finder и открываем Telegram рядом.
-    tg)     open -R "$zip"; open -a "$tg"; copy_file "$zip"
-            say "💬 Открыл Telegram и Finder с выделенным архивом."
-            say "   Перетащите архив мышкой из окна Finder в нужный чат Telegram и нажмите «Отправить»." ;;
+    # Telegram для macOS не принимает файлы через «открыть в программе» и ⌘V — открываем его окно
+    # «Поделиться» с прикреплённым архивом; если не вышло — перетаскивание из Finder.
+    tg)     say "💬 Открываю окно Telegram с архивом: выберите чат и нажмите «Отправить»…"
+            case "$(tg_share "$tg" "$zip")" in
+              shared)    say "✅ Архив отправлен в Telegram." ;;
+              cancelled) say "Отправка отменена. Архив лежит на месте." ;;
+              *)         open -R "$zip"; open -a "$tg"
+                         say "Окно «Поделиться» не открылось — открыл Telegram и Finder с выделенным архивом."
+                         say "   Перетащите архив мышкой из окна Finder в нужный чат Telegram." ;;
+            esac ;;
     mail)   open -a "$mail" "$zip" && say "✉️  Письмо создано: впишите адрес и нажмите «Отправить»." ;;
     clip)   if copy_file "$zip"; then say "📋 Архив скопирован. Откройте нужный чат и нажмите ⌘V."
             else open -R "$zip"; say "Скопировать не удалось — открыл Finder, перетащите архив."; fi ;;
