@@ -14,7 +14,7 @@
 set -o pipefail
 export LC_ALL=C
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 SCHEMA="amnezia-doctor/1"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="$SELF_DIR/lib"
@@ -1035,6 +1035,11 @@ app_path() {  # первое найденное приложение из спи
   return 1
 }
 
+copy_file() {  # путь → буфер обмена как файл (public.file-url), вставляется ⌘V вложением
+  osascript -l JavaScript -e 'function run(a) { ObjC.import("AppKit"); var pb = $.NSPasteboard.generalPasteboard;
+    pb.clearContents; return pb.writeObjects($([$.NSURL.fileURLWithPath(a[0])])) }' "$1" 2>/dev/null | grep -q true
+}
+
 share_menu() {  # архив
   local zip="$1" tg mail key i=0 acts=""
   { : < /dev/tty; } 2>/dev/null || return 0
@@ -1042,7 +1047,7 @@ share_menu() {  # архив
   mail="$(app_path Mail)"
   {
     printf '\n%sКуда отправить архив?%s\n' "$T_B" "$T_RST"
-    if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — откроется выбор чата, архив уже прикреплён\n' "$i"; fi
+    if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — откроется Telegram, архив будет в буфере: выберите чат и ⌘V\n' "$i"; fi
     if [ -n "$mail" ]; then i=$((i + 1)); acts="$acts mail"; printf '  %s) ✉️  Почта — новое письмо с архивом во вложении\n' "$i"; fi
     i=$((i + 1)); acts="$acts clip"; printf '  %s) 📋 Скопировать архив — вставьте ⌘V в любой мессенджер (WhatsApp, Telegram, Slack…)\n' "$i"
     i=$((i + 1)); acts="$acts finder"; printf '  %s) 📂 Показать в Finder — перетащите архив куда нужно\n' "$i"
@@ -1055,12 +1060,12 @@ share_menu() {  # архив
   [ "$key" -ge 1 ] && [ "$key" -le $# ] || { say "Нет такого пункта. Архив лежит на месте."; return 0; }
   eval "key=\${$key}"
   case "$key" in
-    tg)     open -a "$tg" "$zip" && say "💬 Telegram открыт: выберите чат и отправьте." ;;
+    # Telegram для macOS не принимает файлы через «открыть в программе» — передаём через буфер
+    tg)     if copy_file "$zip"; then open -a "$tg"; say "💬 Telegram открыт, архив в буфере обмена: откройте нужный чат и нажмите ⌘V, затем Enter."
+            else open -R "$zip"; open -a "$tg"; say "Не удалось скопировать — открыл Finder и Telegram: перетащите архив в чат."; fi ;;
     mail)   open -a "$mail" "$zip" && say "✉️  Письмо создано: впишите адрес и нажмите «Отправить»." ;;
-    clip)   osascript -l JavaScript -e 'function run(a) { ObjC.import("AppKit"); var pb = $.NSPasteboard.generalPasteboard;
-              pb.clearContents; return pb.writeObjects($([$.NSURL.fileURLWithPath(a[0])])) }' "$zip" 2>/dev/null | grep -q true \
-              && say "📋 Архив скопирован. Откройте нужный чат и нажмите ⌘V." \
-              || { open -R "$zip"; say "Скопировать не удалось — открыл Finder, перетащите архив."; } ;;
+    clip)   if copy_file "$zip"; then say "📋 Архив скопирован. Откройте нужный чат и нажмите ⌘V."
+            else open -R "$zip"; say "Скопировать не удалось — открыл Finder, перетащите архив."; fi ;;
     finder) open -R "$zip" && say "📂 Архив выделен в Finder." ;;
   esac
 }

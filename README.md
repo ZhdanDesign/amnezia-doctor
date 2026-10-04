@@ -19,7 +19,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/m
 
 | | |
 |---|---|
-| 💬 Telegram | откроется Telegram, архив прикреплён — осталось выбрать чат |
+| 💬 Telegram | откроется Telegram, архив уже в буфере обмена — выберите чат и нажмите ⌘V |
 | ✉️ Почта | новое письмо в Mail с архивом во вложении |
 | 📋 Скопировать архив | ⌘V в любом мессенджере вставит архив как файл (WhatsApp, Telegram, Slack…) |
 | 📂 Показать в Finder | архив выделен — перетащите куда нужно |
@@ -126,7 +126,7 @@ nc, ssh и zip, которые есть в системе. На сервере �
 | `--no-share` | не показывать меню отправки архива |
 | `--analyze ПАПКА` | пересобрать отчёт из готового `facts.txt` |
 
-Закрепить версию: `AMNEZIA_DOCTOR_REF=v1.4.0 bash <(curl -fsSL …/run.sh)`.
+Закрепить версию: `AMNEZIA_DOCTOR_REF=v1.4.1 bash <(curl -fsSL …/run.sh)`.
 
 ## Тесты
 
