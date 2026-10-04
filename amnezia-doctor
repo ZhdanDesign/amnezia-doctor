@@ -14,7 +14,7 @@
 set -o pipefail
 export LC_ALL=C
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 SCHEMA="amnezia-doctor/1"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="$SELF_DIR/lib"
@@ -36,7 +36,7 @@ amnezia-doctor — почему на этом Mac не работает Amnezia
   -c ФАЙЛ          сверить с сервером конфиг клиента (.conf или ключ vpn://)
   -o ПАПКА         куда сложить результат (по умолчанию ~/Desktop)
   --no-probe       не проверять доставку UDP до сервера
-  --no-share       не предлагать отправить архив (Telegram, почта, буфер обмена)
+  --no-share       не показывать меню «Что дальше?» (починка через ИИ, отправка архива)
   --analyze ПАПКА  пересобрать отчёт из готового facts.txt
   -V | -h          версия | справка
 EOF
@@ -973,6 +973,7 @@ write_reports() {
   } > "$OUT/report.md"
 
   perl "$LIB/to_json.pl" "$FACTS" "$FIND" "$status" "$pid" "$ptitle" > "$OUT/report.json"
+  write_ai_prompt "$vbig" "$pid" "$ptitle" "$prec"
   cp "$SELF_DIR/docs/LLM_PROMPT.md" "$OUT/LLM_PROMPT.md" 2>/dev/null
 }
 
@@ -1020,6 +1021,91 @@ show_verdict() {
   } >&2
 }
 
+
+# ================================================================ починка с помощью ИИ (Codex / Claude)
+
+write_ai_prompt() {  # вердикт id причина рекомендация → AI_PROMPT.md (детерминированно)
+  {
+    echo "На этом Mac не работает VPN Amnezia (или работает с замечаниями). Я запустил диагностику amnezia-doctor."
+    echo "Ты сейчас в папке с её результатами."
+    echo
+    echo "Итог проверки: $1."
+    [ -n "$2" ] && echo "Главная причина по мнению диагностики: [$2] $3."
+    [ -n "$4" ] && echo "Рекомендация диагностики: $4"
+    echo
+    echo "Что сделать:"
+    echo "1. Прочитай LLM_PROMPT.md (как читать отчёт), затем report.json и report.md; при необходимости — raw/client/active_tests.txt и другие файлы в raw/."
+    echo "2. Объясни мне простыми словами, почему не работает. Я не технический специалист."
+    echo "3. Помоги исправить по шагам. Сначала предложи безопасные действия. Перед любым изменением настроек Mac (сеть, DNS, прокси, файрвол, маршруты) или приложения Amnezia объясни, что изменится, и дождись моего согласия."
+    echo "4. Сейчас интернет идёт через запасной VPN — иначе связь с тобой оборвётся. Шаги, для которых нужно выключить запасной VPN и включить Amnezia, дай мне списком, чтобы я выполнил их после выхода из этой сессии."
+    echo "5. Не читай и не выводи приватные ключи, пароли и ключи подключения vpn://."
+    echo "6. В конце скажи, как проверить результат: выключить запасной VPN, включить Amnezia и снова запустить в Терминале:"
+    echo "   bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh)"
+    echo
+    echo "Отвечай по-русски."
+  } > "$OUT/AI_PROMPT.md"
+}
+
+# страны, где Codex (OpenAI) и Claude (Anthropic) недоступны
+AI_BLOCKED=" RU BY CN HK IR KP CU SY VE AF "
+
+ai_reach() {  # codex|claude → "ok IP СТРАНА" или текст причины
+  local host api trace ip loc code
+  case "$1" in
+    codex)  host=chatgpt.com; api=https://api.openai.com/v1/models ;;
+    claude) host=claude.ai;   api=https://api.anthropic.com/v1/messages ;;
+  esac
+  code="$(http_code "$api")"
+  if [ "$code" = 000 ]; then printf 'нет связи с %s — интернета нет или VPN не подключён' "${api%%/v1*}"; return 1; fi
+  trace="$(to 12 curl -s -m 8 "https://$host/cdn-cgi/trace" 2>/dev/null)"
+  ip="$(printf '%s\n' "$trace" | sed -n 's/^ip=//p')"
+  loc="$(printf '%s\n' "$trace" | sed -n 's/^loc=//p')"
+  case "$AI_BLOCKED" in *" $loc "*) printf 'выход в интернет через %s (%s) — оттуда %s недоступен; нужен VPN в другую страну' "$loc" "$ip" "$host"; return 1 ;; esac
+  if [ "$code" = 403 ]; then printf '%s отвечает «доступ запрещён» (403) — смените страну VPN' "${api%%/v1*}"; return 1; fi
+  printf 'ok %s %s' "$ip" "${loc:-?}"
+}
+
+ai_fix() {  # codex|claude
+  local tool="$1" name r key
+  case "$tool" in codex) name="Codex" ;; claude) name="Claude Code" ;; esac
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    say ""
+    say "🤖 $name не установлен на этом Mac. Установка (нужен рабочий интернет):"
+    case "$tool" in
+      codex)  say "   npm install -g @openai/codex   — или: brew install codex" ;;
+      claude) say "   curl -fsSL https://claude.ai/install.sh | bash" ;;
+    esac
+    say "Затем запустите $tool в папке с результатами: cd \"$OUT\" && $tool \"\$(cat AI_PROMPT.md)\""
+    return 0
+  fi
+  {
+    printf '\n'
+    bar "$T_BG_WARN" ""
+    bar "$T_BG_WARN" "$T_B   ⚠️   ВКЛЮЧИТЕ ЗАПАСНОЙ VPN"
+    bar "$T_BG_WARN" "       $name работает через интернет, а через Amnezia связи сейчас может не быть"
+    bar "$T_BG_WARN" ""
+    printf '\n  1. Отключите VPN в Amnezia.\n  2. Включите любой другой работающий VPN.\n  3. Нажмите Enter — я проверю, что связь с %s есть.  (q — отмена)\n' "$name"
+  } >&2
+  while :; do
+    printf '\n> ' >&2
+    IFS= read -r key < /dev/tty || return 0
+    case "$key" in q|Q|й|Й) say "Отменено. Промпт для ИИ лежит в $OUT/AI_PROMPT.md"; return 0 ;; esac
+    say "🔍 Проверяю связь с $name…"
+    if r="$(ai_reach "$tool")"; then
+      set -- $r
+      say "${T_OK}✅ Запасной VPN работает: выход через $2 ($3), $name доступен.${T_RST}"
+      break
+    fi
+    say "${T_FAIL}❌ $r.${T_RST}"
+    say "Проверьте запасной VPN и нажмите Enter ещё раз (q — отмена)."
+  done
+  say ""
+  say "🤖 Запускаю $name с задачей на исправление. Папка с результатами: $OUT"
+  say ""
+  cd "$OUT" || return 1
+  "$tool" "$(cat AI_PROMPT.md)" < /dev/tty > /dev/tty 2>&1
+}
+
 # ================================================================ передача архива дальше
 
 # file:// ссылка: Терминал и iTerm открывают её по ⌘+клику
@@ -1041,25 +1127,34 @@ copy_file() {  # путь → буфер обмена как файл (public.fi
 }
 
 share_menu() {  # архив
-  local zip="$1" tg mail key i=0 acts=""
+  local zip="$1" tg mail key i=0 acts="" def=""
   { : < /dev/tty; } 2>/dev/null || return 0
   tg="$(app_path Telegram "Telegram Desktop")"
   mail="$(app_path Mail)"
+  [ "$VERDICT_STATUS" != OK ] && def=codex
   {
-    printf '\n%sКуда отправить архив?%s\n' "$T_B" "$T_RST"
+    printf '\n%sЧто дальше?%s\n' "$T_B" "$T_RST"
+    i=$((i + 1)); acts="$acts codex"
+    printf '  %s) 🤖 Починить с помощью Codex%s\n' "$i" "$([ "$def" = codex ] && printf ' ← Enter')"
+    i=$((i + 1)); acts="$acts claude"; printf '  %s) 🤖 Починить с помощью Claude Code\n' "$i"
     if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — откроется Telegram, архив будет в буфере: выберите чат и ⌘V\n' "$i"; fi
     if [ -n "$mail" ]; then i=$((i + 1)); acts="$acts mail"; printf '  %s) ✉️  Почта — новое письмо с архивом во вложении\n' "$i"; fi
     i=$((i + 1)); acts="$acts clip"; printf '  %s) 📋 Скопировать архив — вставьте ⌘V в любой мессенджер (WhatsApp, Telegram, Slack…)\n' "$i"
     i=$((i + 1)); acts="$acts finder"; printf '  %s) 📂 Показать в Finder — перетащите архив куда нужно\n' "$i"
-    printf '  Enter) ничего не делать\n\n'
+    printf '  0) выход%s\n\n' "$([ -z "$def" ] && printf ' ← Enter')"
     printf 'Выбор: '
   } >&2
-  IFS= read -r -t 300 key < /dev/tty || key=""
-  case "$key" in ''|*[!0-9]*) say "Готово. Архив лежит на месте."; return 0 ;; esac
+  IFS= read -r -t 300 key < /dev/tty || key=0
+  if [ -z "$key" ]; then
+    [ -n "$def" ] && { ai_fix "$def"; return; }
+    key=0
+  fi
+  case "$key" in 0) say "Готово. Архив лежит на месте."; return 0 ;; *[!0-9]*) say "Нет такого пункта. Архив лежит на месте."; return 0 ;; esac
   set -- $acts
   [ "$key" -ge 1 ] && [ "$key" -le $# ] || { say "Нет такого пункта. Архив лежит на месте."; return 0; }
   eval "key=\${$key}"
   case "$key" in
+    codex|claude) ai_fix "$key" ;;
     # Telegram для macOS не принимает файлы через «открыть в программе» — передаём через буфер
     tg)     if copy_file "$zip"; then open -a "$tg"; say "💬 Telegram открыт, архив в буфере обмена: откройте нужный чат и нажмите ⌘V, затем Enter."
             else open -R "$zip"; open -a "$tg"; say "Не удалось скопировать — открыл Finder и Telegram: перетащите архив в чат."; fi ;;
