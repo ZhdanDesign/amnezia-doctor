@@ -14,7 +14,7 @@
 set -o pipefail
 export LC_ALL=C
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 SCHEMA="amnezia-doctor/1"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="$SELF_DIR/lib"
@@ -36,12 +36,13 @@ amnezia-doctor — почему на этом Mac не работает Amnezia
   -c ФАЙЛ          сверить с сервером конфиг клиента (.conf или ключ vpn://)
   -o ПАПКА         куда сложить результат (по умолчанию ~/Desktop)
   --no-probe       не проверять доставку UDP до сервера
+  --no-share       не предлагать отправить архив (Telegram, почта, буфер обмена)
   --analyze ПАПКА  пересобрать отчёт из готового facts.txt
   -V | -h          версия | справка
 EOF
 }
 
-TARGET=""; SSH_PORT=22; SSH_KEY=""; CLIENT_CFG=""; OUT_BASE=""; DO_PROBE=1; ANALYZE_DIR=""
+TARGET=""; SSH_PORT=22; SSH_KEY=""; CLIENT_CFG=""; OUT_BASE=""; DO_PROBE=1; DO_SHARE=1; ANALYZE_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -p) SSH_PORT="$2"; shift 2 ;;
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
     -c) CLIENT_CFG="$2"; shift 2 ;;
     -o) OUT_BASE="$2"; shift 2 ;;
     --no-probe) DO_PROBE=0; shift ;;
+    --no-share) DO_SHARE=0; shift ;;
     --analyze) ANALYZE_DIR="$2"; shift 2 ;;
     -V|--version) echo "$VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
@@ -1018,6 +1020,51 @@ show_verdict() {
   } >&2
 }
 
+# ================================================================ передача архива дальше
+
+# file:// ссылка: Терминал и iTerm открывают её по ⌘+клику
+file_url() { perl -e '(my $p = $ARGV[0]) =~ s{([^A-Za-z0-9\-._~/])}{sprintf("%%%02X", ord $1)}ge; print "file://$p"' "$1"; }
+
+app_path() {  # первое найденное приложение из списка имён
+  local n
+  for n in "$@"; do
+    [ -d "/Applications/$n.app" ] && { printf '/Applications/%s.app' "$n"; return 0; }
+    [ -d "$HOME/Applications/$n.app" ] && { printf '%s/Applications/%s.app' "$HOME" "$n"; return 0; }
+    [ -d "/System/Applications/$n.app" ] && { printf '/System/Applications/%s.app' "$n"; return 0; }
+  done
+  return 1
+}
+
+share_menu() {  # архив
+  local zip="$1" tg mail key i=0 acts=""
+  { : < /dev/tty; } 2>/dev/null || return 0
+  tg="$(app_path Telegram "Telegram Desktop")"
+  mail="$(app_path Mail)"
+  {
+    printf '\n%sКуда отправить архив?%s\n' "$T_B" "$T_RST"
+    if [ -n "$tg" ]; then i=$((i + 1)); acts="$acts tg"; printf '  %s) 💬 Telegram — откроется выбор чата, архив уже прикреплён\n' "$i"; fi
+    if [ -n "$mail" ]; then i=$((i + 1)); acts="$acts mail"; printf '  %s) ✉️  Почта — новое письмо с архивом во вложении\n' "$i"; fi
+    i=$((i + 1)); acts="$acts clip"; printf '  %s) 📋 Скопировать архив — вставьте ⌘V в любой мессенджер (WhatsApp, Telegram, Slack…)\n' "$i"
+    i=$((i + 1)); acts="$acts finder"; printf '  %s) 📂 Показать в Finder — перетащите архив куда нужно\n' "$i"
+    printf '  Enter) ничего не делать\n\n'
+    printf 'Выбор: '
+  } >&2
+  IFS= read -r -t 300 key < /dev/tty || key=""
+  case "$key" in ''|*[!0-9]*) say "Готово. Архив лежит на месте."; return 0 ;; esac
+  set -- $acts
+  [ "$key" -ge 1 ] && [ "$key" -le $# ] || { say "Нет такого пункта. Архив лежит на месте."; return 0; }
+  eval "key=\${$key}"
+  case "$key" in
+    tg)     open -a "$tg" "$zip" && say "💬 Telegram открыт: выберите чат и отправьте." ;;
+    mail)   open -a "$mail" "$zip" && say "✉️  Письмо создано: впишите адрес и нажмите «Отправить»." ;;
+    clip)   osascript -l JavaScript -e 'function run(a) { ObjC.import("AppKit"); var pb = $.NSPasteboard.generalPasteboard;
+              pb.clearContents; return pb.writeObjects($([$.NSURL.fileURLWithPath(a[0])])) }' "$zip" 2>/dev/null | grep -q true \
+              && say "📋 Архив скопирован. Откройте нужный чат и нажмите ⌘V." \
+              || { open -R "$zip"; say "Скопировать не удалось — открыл Finder, перетащите архив."; } ;;
+    finder) open -R "$zip" && say "📂 Архив выделен в Finder." ;;
+  esac
+}
+
 normalize_facts() {
   # первое значение ключа побеждает; сортировка — для стабильности отчёта
   awk '{ k = $0; sub(/=.*/, "", k); if (!(k in s)) { s[k] = 1; print } }' "$FACTS" | LC_ALL=C sort > "$FACTS.tmp" && mv "$FACTS.tmp" "$FACTS"
@@ -1086,5 +1133,8 @@ write_reports
 
 show_verdict
 say ""
-say "📄 Отчёт:  $OUT/report.md"
 say "📦 Архив:  $OUT_BASE/$NAME.zip  ← его и пришлите"
+say "   📂 открыть папку:  $(file_url "$OUT_BASE")"
+say "   📄 открыть отчёт:  $(file_url "$OUT/report.md")"
+say "   (⌘ Cmd + клик по ссылке)"
+[ "$DO_SHARE" = 1 ] && share_menu "$OUT_BASE/$NAME.zip"
