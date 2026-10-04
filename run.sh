@@ -1,0 +1,18 @@
+#!/bin/bash
+# Загрузчик amnezia-doctor: скачивает пакет скриптов с GitHub во временную папку и запускает проверку.
+#
+#   bash <(curl -fsSL https://raw.githubusercontent.com/ZhdanDesign/amnezia-doctor/main/run.sh) root@IP
+#
+# Версию можно закрепить: AMNEZIA_DOCTOR_REF=v1.0.0 bash <(curl -fsSL …/run.sh) root@IP
+set -euo pipefail
+
+REPO="ZhdanDesign/amnezia-doctor"
+REF="${AMNEZIA_DOCTOR_REF:-main}"
+
+dir="$(mktemp -d /tmp/amnezia-doctor.XXXXXX)"
+trap 'rm -rf "$dir"' EXIT
+
+echo "Загружаю $REPO@$REF …" >&2
+curl -fsSL "https://codeload.github.com/$REPO/tar.gz/$REF" | tar -xz -C "$dir" --strip-components 1
+
+/bin/bash "$dir/amnezia-doctor" "$@"

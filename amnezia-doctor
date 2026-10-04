@@ -1,0 +1,781 @@
+#!/bin/bash
+# amnezia-doctor — детерминированная диагностика подключения к Amnezia с Mac.
+#
+# Проверяет три стороны: Mac (клиент), сеть между Mac и сервером, сервер по SSH.
+# На сервере только читает — ничего не устанавливает и не меняет.
+# Результат: папка + zip с report.md, report.json, LLM_PROMPT.md и сырыми логами.
+#
+# Детерминированность: фиксированный набор проверок, фиксированный порядок, фиксированные
+# пороги и тексты рекомендаций. Одинаковые facts.txt дают байт-в-байт одинаковые отчёты
+# (проверяется: amnezia-doctor --analyze <папка>).
+#
+# Совместим с /bin/bash 3.2 и стоковым macOS: нужны только perl, curl, nc, ssh, zip.
+
+set -o pipefail
+export LC_ALL=C
+
+VERSION="1.0.0"
+SCHEMA="amnezia-doctor/1"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB="$SELF_DIR/lib"
+
+usage() {
+  cat <<'EOF'
+amnezia-doctor — диагностика подключения к Amnezia (AmneziaWG / WireGuard / Amnezia в Docker)
+
+Использование:
+  amnezia-doctor [параметры] пользователь@сервер
+
+Параметры:
+  -p ПОРТ        порт SSH (по умолчанию 22)
+  -i КЛЮЧ        приватный SSH-ключ
+  -c ФАЙЛ        клиентский конфиг: .conf или файл с ключом vpn://  (сверка с сервером)
+  -o ПАПКА       куда сложить результат (по умолчанию ~/Desktop)
+  --no-probe     не проверять доставку UDP-пакетов до сервера
+  --analyze ПАПКА  пересобрать отчёт из готового facts.txt (без сети)
+  -V             версия
+  -h             справка
+
+Примеры:
+  amnezia-doctor root@203.0.113.10
+  amnezia-doctor -i ~/.ssh/id_ed25519 -c ~/Downloads/mac.conf root@203.0.113.10
+
+Пароль SSH, если нужен, вводится один раз — дальше соединение переиспользуется.
+EOF
+}
+
+TARGET=""; SSH_PORT=22; SSH_KEY=""; CLIENT_CFG=""; OUT_BASE=""; DO_PROBE=1; ANALYZE_DIR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) SSH_PORT="$2"; shift 2 ;;
+    -i) SSH_KEY="$2"; shift 2 ;;
+    -c) CLIENT_CFG="$2"; shift 2 ;;
+    -o) OUT_BASE="$2"; shift 2 ;;
+    --no-probe) DO_PROBE=0; shift ;;
+    --analyze) ANALYZE_DIR="$2"; shift 2 ;;
+    -V|--version) echo "$VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "Неизвестный параметр: $1" >&2; usage >&2; exit 2 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+
+# ================================================================ утилиты
+
+say()  { printf '%s\n' "$*" >&2; }
+step() { printf '\n== %s\n' "$*" >&2; }
+
+# таймаут без coreutils: alarm переживает exec и завершает процесс по истечении
+to() { local s="$1"; shift; perl -e 'alarm shift @ARGV; exec @ARGV; exit 127' "$s" "$@"; }
+
+oneline() { tr -d '\r' | tr '\n\t' '  ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'; }
+
+setf() {
+  local k="$1"; shift
+  local v; v="$(printf '%s' "$*" | oneline)"
+  printf '%s=%s\n' "$k" "${v:0:400}" >> "$FACTS"
+}
+
+getf() { awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$FACTS"; }
+
+isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+http_code() {
+  local c; c="$(to 12 curl -s -o /dev/null -m 8 -w '%{http_code}' "$1" 2>/dev/null)"
+  printf '%s' "${c:-000}"
+}
+
+redact() {
+  perl -pe '
+    s/((?:private|preshared|psk|password|passwd|secret|token|priv_key|privkey)[A-Za-z_ ]*["\x27]?\s*[:=]\s*["\x27]?)[^"\x27\s,}]+/$1<REDACTED>/gi;
+    s#vpn://[A-Za-z0-9_=-]+#vpn://<REDACTED>#g;
+    s/\b(ether\s+)[0-9a-f:]{17}/$1<MAC>/gi;
+  ' | perl -0777 -pe 's/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/<REDACTED PRIVATE KEY BLOCK>/gs'
+}
+
+# ================================================================ сбор: Mac
+
+collect_client() {
+  step "Mac: система и сеть"
+  setf C_MACOS "$(sw_vers -productVersion 2>/dev/null)"
+  setf C_ARCH "$(uname -m)"
+  setf C_NOW "$(date +%s)"
+
+  local dif
+  dif="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  setf C_DEFAULT_IF "$dif"
+  setf C_DEFAULT_GW "$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')"
+  [ -n "$dif" ] && setf C_DEFAULT_IF_MTU "$(ifconfig "$dif" 2>/dev/null | awk '/mtu/{print $NF; exit}')"
+  setf C_ROUTE_1111_IF "$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  setf C_UTUN_COUNT "$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -c '^utun')"
+  setf C_IPV6_GLOBAL "$(ifconfig 2>/dev/null | awk '$1=="inet6" && $2 !~ /^fe80/ && $2 != "::1" {c++} END{print c+0}')"
+
+  setf C_HTTP_1111 "$(http_code https://1.1.1.1/)"
+  setf C_DNS_RESOLVE "$(to 10 dscacheutil -q host -a name one.one.one.one 2>/dev/null | grep -q ip_address && echo yes || echo no)"
+  local pub
+  pub="$(to 10 curl -s -m 8 https://api.ipify.org 2>/dev/null)"
+  printf '%s' "$pub" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || pub="$(to 10 curl -s -m 8 https://ifconfig.me/ip 2>/dev/null)"
+  printf '%s' "$pub" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || pub=""
+  setf C_PUBLIC_IP "$pub"
+
+  setf C_DNS_SERVERS "$(scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/{print $3}' | awk '!s[$0]++' | head -n 4 | tr '\n' ' ')"
+  setf C_PROXY "$(scutil --proxy 2>/dev/null | awk '($1=="HTTPEnable"||$1=="HTTPSEnable"||$1=="SOCKSEnable"||$1=="ProxyAutoConfigEnable") && $3=="1" {sub(/Enable$/, "", $1); print $1}' | sort | tr '\n' ' ')"
+  setf C_FIREWALL "$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -q enabled && echo enabled || echo disabled)"
+
+  step "Mac: VPN-приложения"
+  local procs
+  procs="$(ps -axo comm= 2>/dev/null | awk -F/ '{print tolower($NF)}' \
+    | grep -E 'amnezia|happ|v2ray|xray|sing-box|singbox|clash|mihomo|nekoray|nekobox|hiddify|streisand|foxray|outline|wireguard|tunnelblick|openvpn|nordvpn|expressvpn|protonvpn|surfshark|warp|tailscale|zerotier|karing|shadowrocket' \
+    | grep -v widget | sort -u | tr '\n' ' ')"
+  setf C_VPN_PROCS "$procs"
+  setf C_OTHER_VPN_PROCS "$(printf '%s' "$procs" | tr ' ' '\n' | grep -v amnezia | grep -v '^$' | tr '\n' ' ')"
+  setf C_AMNEZIA_RUNNING "$(printf '%s' "$procs" | grep -q amnezia && echo yes || echo no)"
+
+  local app="" p
+  for p in /Applications/AmneziaVPN.app "$HOME/Applications/AmneziaVPN.app" /Applications/*[Aa]mnezia*.app; do
+    [ -d "$p" ] && { app="$p"; break; }
+  done
+  if [ -n "$app" ]; then
+    setf C_AMNEZIA_APP present
+    setf C_AMNEZIA_APP_VERSION "$(defaults read "$app/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
+  else
+    setf C_AMNEZIA_APP absent
+  fi
+
+  step "Mac: логи Amnezia"
+  local base files f n=0 err=0
+  : > "$RAW/client/amnezia_logs.txt"
+  # ~/Library/Containers не трогаем: доступ туда вызывает системный запрос macOS
+  files="$(for base in "$HOME/Library/Application Support" "$HOME/Library/Logs" "$HOME/Library/Caches" "/Library/Application Support" "/Library/Logs"; do
+      [ -d "$base" ] || continue
+      find "$base" -maxdepth 2 -iname '*amnezia*' -type d 2>/dev/null
+    done | LC_ALL=C sort -u | while IFS= read -r d; do
+      find "$d" -maxdepth 4 -type f \( -name '*.log' -o -name '*.txt' \) -exec stat -f '%m %N' {} + 2>/dev/null
+    done | sort -rn | head -n 3 | cut -d' ' -f2-)"
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    n=$((n + 1))
+    { printf '===== %s\n' "$f"; tail -n 200 "$f"; echo; } 2>/dev/null | redact >> "$RAW/client/amnezia_logs.txt"
+    err=$((err + $(tail -n 200 "$f" 2>/dev/null | grep -ciE 'error|fail|timeout|refused|denied')))
+  done <<EOF
+$files
+EOF
+  setf C_AMNEZIA_LOG_FILES "$n"
+  setf C_AMNEZIA_LOG_ERR "$err"
+  to 60 log show --last 30m --style compact --predicate 'process CONTAINS[c] "amnezia"' 2>/dev/null \
+    | tail -n 300 | redact > "$RAW/client/amnezia_unified_log.txt"
+  setf C_AMNEZIA_ULOG_LINES "$(grep -vc '^Timestamp' "$RAW/client/amnezia_unified_log.txt" 2>/dev/null)"
+
+  netstat -rn -f inet 2>/dev/null > "$RAW/client/routes.txt"
+  ifconfig 2>/dev/null | redact > "$RAW/client/ifconfig.txt"
+  scutil --dns 2>/dev/null | head -n 80 > "$RAW/client/dns.txt"
+  scutil --proxy 2>/dev/null > "$RAW/client/proxy.txt"
+}
+
+# ================================================================ сбор: клиентский конфиг
+
+collect_client_cfg() {
+  if [ -z "$CLIENT_CFG" ]; then setf K_PRESENT no; return; fi
+  step "Клиентский конфиг: $CLIENT_CFG"
+  perl "$LIB/parse_client_config.pl" "$CLIENT_CFG" > "$RAW/client/config_parsed.txt" 2>&1
+  cat "$RAW/client/config_parsed.txt" >> "$FACTS"
+}
+
+# ================================================================ сбор: сеть
+
+collect_network() {
+  step "Сеть: доступность $HOST"
+  setf N_TARGET_HOST "$HOST"
+  setf N_SSH_PORT "$SSH_PORT"
+  local ip=""
+  if printf '%s' "$HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    ip="$HOST"
+  else
+    ip="$(to 10 dscacheutil -q host -a name "$HOST" 2>/dev/null | awk '/^ip_address:/{print $2; exit}')"
+  fi
+  setf N_TARGET_IP "$ip"
+  [ -z "$ip" ] && return
+  TIP="$ip"
+
+  local out loss
+  out="$(to 20 ping -c 3 -t 10 "$ip" 2>&1)"
+  printf '%s\n' "$out" > "$RAW/network_ping.txt"
+  loss="$(printf '%s\n' "$out" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' | cut -d. -f1)"
+  isnum "$loss" || loss=100
+  setf N_PING_LOSS "$loss"
+  if [ "$loss" -lt 100 ]; then setf N_PING ok; else setf N_PING fail; fi
+  setf C_ROUTE_TO_TARGET_IF "$(route -n get "$ip" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  if to 12 nc -z -G 8 "$ip" "$SSH_PORT" >/dev/null 2>&1; then setf N_SSH_TCP ok; else setf N_SSH_TCP fail; fi
+}
+
+# ================================================================ сбор: сервер
+
+collect_server() {
+  [ "$(getf N_SSH_TCP)" = ok ] || { setf N_SSH_AUTH skipped; return; }
+  step "SSH: вход на $TARGET (пароль, если спросят, вводится один раз)"
+  SSH_BASE=(-p "$SSH_PORT" -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3
+            -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR
+            -o ControlMaster=auto -o "ControlPath=$CTL/%C" -o ControlPersist=300)
+  [ -n "$SSH_KEY" ] && SSH_BASE+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+
+  if to 120 ssh "${SSH_BASE[@]}" "$TARGET" true 2> "$RAW/ssh_auth_stderr.txt"; then
+    setf N_SSH_AUTH ok
+  else
+    setf N_SSH_AUTH fail
+    setf N_SSH_ERROR "$(grep -v '^$' "$RAW/ssh_auth_stderr.txt" | tail -n 2)"
+    return
+  fi
+
+  step "Сервер: сбор фактов (только чтение)"
+  setf C_NOW_AT_PROBE "$(date +%s)"
+  to 240 ssh "${SSH_BASE[@]}" "$TARGET" "bash -s -- '$TIP' '$(getf C_PUBLIC_IP)'" \
+    < "$LIB/server_probe.sh" > "$RAW/server_probe.out" 2> "$RAW/server_probe.stderr"
+  grep '^@@FACT ' "$RAW/server_probe.out" | sed 's/^@@FACT //' | awk '{print substr($0, 1, 420)}' >> "$FACTS"
+  awk -v dir="$RAW/server" '
+    /^@@BEGIN / { f = dir "/" $2 ".txt"; next }
+    /^@@END /   { if (f != "") close(f); f = ""; next }
+    /^@@FACT /  { next }
+    f != ""     { print > f }
+  ' "$RAW/server_probe.out"
+}
+
+# ================================================================ сбор: доставка пакетов
+
+collect_probe() {
+  if [ "$DO_PROBE" != 1 ]; then setf N_PROBE_STATUS skipped:disabled; return; fi
+  if [ "$(getf N_SSH_AUTH)" != ok ] || [ "$(getf P_DONE)" != yes ]; then setf N_PROBE_STATUS skipped:no_server_access; return; fi
+  if [ "$(getf S_HAS_TCPDUMP)" != yes ]; then setf N_PROBE_STATUS skipped:no_tcpdump; return; fi
+  local sudo_r=""
+  if [ "$(getf S_IS_ROOT)" != yes ]; then
+    if [ "$(getf S_SUDO)" = nopass ]; then sudo_r="sudo -n"; else setf N_PROBE_STATUS skipped:no_root; return; fi
+  fi
+
+  local nif i ports p filter="" tports
+  nif="$(getf S_IF_COUNT)"; isnum "$nif" || nif=0
+  ports="$({
+      i=1; while [ "$i" -le "$nif" ]; do getf "S_IF_${i}_PORT"; i=$((i + 1)); done
+      getf S_LISTEN | tr ' ' '\n' | awk -F/ '$1=="udp"{print $2}'
+    } | grep -E '^[0-9]+$' | grep -vxE '53|67|68|123|5353' | sort -n -u | head -n 6 | tr '\n' ' ')"
+  ports="$(printf '%s' "$ports" | sed 's/ $//')"
+  setf N_PROBE_VIA_IF "$(getf C_ROUTE_TO_TARGET_IF)"
+
+  tports="$(getf S_LISTEN | tr ' ' '\n' | awk -F/ -v s="$SSH_PORT" -v d="$(getf S_SSHD_PORT)" '$1=="tcp" && $2!=s && $2!=d {print $2}' | sort -n -u | head -n 6 | tr '\n' ' ' | sed 's/ $//')"
+  setf N_PROBE_TCP_PORTS "$tports"
+  for p in $tports; do
+    if to 10 nc -z -G 6 "$TIP" "$p" >/dev/null 2>&1; then setf "N_PROBE_TCP_$p" open; else setf "N_PROBE_TCP_$p" closed; fi
+  done
+
+  if [ -z "$ports" ]; then setf N_PROBE_STATUS skipped:no_udp_ports; return; fi
+  step "Сеть: доходят ли UDP-пакеты до сервера (порты: $ports)"
+  setf N_PROBE_UDP_PORTS "$ports"
+  for p in $ports; do filter="${filter:+$filter or }dst port $p"; done
+  # маркер "AMNZ" в начале полезной нагрузки — ловим только свои пакеты
+  filter="udp and udp[8:4] = 0x414d4e5a and ($filter)"
+
+  to 40 ssh "${SSH_BASE[@]}" "$TARGET" "$sudo_r timeout 20 tcpdump -n -l -i any '$filter' 2>&1; true" \
+    > "$RAW/probe_capture.txt" 2>&1 &
+  local bg=$!
+  sleep 5
+  perl -MIO::Socket::INET -e '
+    my ($ip, @ports) = @ARGV;
+    for my $p (@ports) {
+      my $s = IO::Socket::INET->new(PeerAddr => $ip, PeerPort => $p, Proto => "udp") or next;
+      for my $k (1 .. 5) { $s->send("AMNZ-DOCTOR-PROBE-$k"); select(undef, undef, undef, 0.2); }
+      close $s;
+    }' "$TIP" $ports
+  wait "$bg"
+
+  if ! grep -q 'listening on' "$RAW/probe_capture.txt"; then setf N_PROBE_STATUS error:capture_not_started; return; fi
+  setf N_PROBE_STATUS ok
+  local got
+  for p in $ports; do
+    got="$(grep -cE "\.${p}: UDP" "$RAW/probe_capture.txt")"
+    [ "$got" -gt 5 ] && got=5
+    setf "N_PROBE_UDP_$p" "$got/5"
+  done
+}
+
+# ================================================================ анализ
+
+add() {
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" \
+    "$(printf '%s' "$3" | oneline)" "$(printf '%s' "$4" | oneline)" "$(printf '%s' "$5" | oneline)" >> "$FIND"
+}
+
+an_network() {
+  local host tip sshp ping tcp
+  host="$(getf N_TARGET_HOST)"; tip="$(getf N_TARGET_IP)"; sshp="$(getf N_SSH_PORT)"
+  if [ -z "$tip" ]; then
+    add FAIL NET01 "Не удалось определить IP сервера" "адрес: $host" \
+      "Проверьте адрес: опечатка в имени или DNS его не знает. Укажите IP напрямую."
+    return
+  fi
+  ping="$(getf N_PING)"; tcp="$(getf N_SSH_TCP)"
+  case "$ping/$tcp" in
+    fail/fail) add FAIL NET02 "Сервер недоступен из этой сети: нет ни ping, ни TCP/$sshp" \
+      "ping $tip: потери $(getf N_PING_LOSS)%; TCP $tip:$sshp: нет соединения; маршрут через $(getf C_ROUTE_TO_TARGET_IF)" \
+      "1) В панели хостера: сервер включён и оплачен? Частая причина — закончился пробный период. 2) Повторите с другой сети, например с мобильного интернета: если оттуда доступен — IP заблокирован провайдером. 3) После переустановки ОС IP мог смениться — сверьте с панелью." ;;
+    fail/ok) add INFO NET03 "ping заблокирован, TCP работает" "ping $tip: потери 100%; TCP $sshp открыт" \
+      "Норма для многих хостеров, действий не нужно." ;;
+    ok/fail) add FAIL NET04 "Сервер в сети, но SSH-порт $sshp не отвечает" "ping: ok; TCP $tip:$sshp: нет соединения" \
+      "Проверьте номер порта SSH (параметр -p), что sshd запущен, правила ufw и файрвола в панели хостера. Без SSH — через веб-консоль хостера." ;;
+    *) add OK NET05 "Сервер доступен по сети" "ping: потери $(getf N_PING_LOSS)%; TCP $sshp открыт" "" ;;
+  esac
+}
+
+an_ssh() {
+  local auth err rec tip
+  auth="$(getf N_SSH_AUTH)"; tip="$(getf N_TARGET_IP)"
+  case "$auth" in
+    ok) add OK SSH02 "SSH-вход выполнен" "пользователь: $(getf S_USER); root: $(getf S_IS_ROOT); sudo: $(getf S_SUDO)" "" ;;
+    fail)
+      err="$(getf N_SSH_ERROR)"
+      rec="Проверьте пользователя и способ входа."
+      case "$err" in
+        *"Permission denied"*) rec="Сервер не принял ключ или пароль. Укажите ключ параметром -i или войдите паролем. Если вход по паролю выключен — добавьте свой публичный ключ в ~/.ssh/authorized_keys через веб-консоль хостера." ;;
+        *"IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*) rec="Сервер переустановлен, сменился ключ хоста. Выполните: ssh-keygen -R $tip — и запустите диагностику снова." ;;
+        *"timed out"*|*"Connection refused"*|*"Connection closed"*) rec="SSH обрывает соединение: проверьте порт, файрвол, не забанен ли ваш IP через fail2ban (проверка с другой сети)." ;;
+      esac
+      add FAIL SSH01 "SSH-вход не удался" "$err" "$rec" ;;
+  esac
+}
+
+an_server() {
+  [ "$(getf N_SSH_AUTH)" = ok ] || return 1
+  if [ "$(getf P_DONE)" != yes ]; then
+    add FAIL SRV00 "Сбор фактов на сервере не завершился" "см. raw/server_probe.stderr" \
+      "На сервере нужен bash. Если вывод оборвался — сервер перегружен или соединение рвётся; повторите запуск."
+    return 1
+  fi
+  if [ "$(getf S_IS_ROOT)" != yes ] && [ "$(getf S_SUDO)" != nopass ]; then
+    add WARN SRV01 "Нет root и sudo без пароля — часть проверок неполная" "пользователь: $(getf S_USER)" \
+      "Запустите диагностику от root (root@сервер) или разрешите этому пользователю sudo без пароля."
+  fi
+  if [ "$(getf S_REBOOT_REQUIRED)" = yes ]; then
+    add WARN SRV02 "Сервер ждёт перезагрузки" "ядро: $(getf S_KERNEL); dkms: $(getf S_DKMS)" \
+      "Перезагрузите в удобное время (sudo reboot). Перед этим убедитесь, что dkms status показывает модуль amneziawg и для нового ядра."
+  fi
+  local mem disk
+  mem="$(getf S_MEM_AVAIL_MB)"; disk="$(getf S_DISK_FREE_MB)"
+  if isnum "$mem"; then
+    if [ "$mem" -lt 50 ]; then
+      add FAIL SRV03 "Критически мало свободной памяти: $mem МБ" "всего: $(getf S_MEM_TOTAL_MB) МБ; swap: $(getf S_SWAP_TOTAL_MB) МБ" \
+        "Контейнеры и туннель могут убиваться OOM. Освободите память, добавьте swap или увеличьте тариф."
+    elif [ "$mem" -lt 150 ]; then
+      add WARN SRV03 "Мало свободной памяти: $mem МБ" "всего: $(getf S_MEM_TOTAL_MB) МБ; swap: $(getf S_SWAP_TOTAL_MB) МБ" \
+        "Amnezia в Docker требует 200–300 МБ. Добавьте swap или увеличьте тариф."
+    fi
+  fi
+  if isnum "$disk"; then
+    if [ "$disk" -lt 300 ]; then
+      add FAIL SRV04 "Почти нет места на диске: $disk МБ" "" "Освободите место: docker system prune, apt clean, старые логи journalctl --vacuum-size=100M."
+    elif [ "$disk" -lt 1024 ]; then
+      add WARN SRV04 "Мало места на диске: $disk МБ" "" "Освободите место: apt clean, journalctl --vacuum-size=100M."
+    fi
+  fi
+  local cn sn d
+  cn="$(getf C_NOW_AT_PROBE)"; sn="$(getf S_NOW)"
+  if isnum "$cn" && isnum "$sn"; then
+    d=$((cn - sn)); [ "$d" -lt 0 ] && d=$((-d))
+    if [ "$d" -gt 120 ]; then
+      add WARN SRV05 "Часы Mac и сервера расходятся на $d с" "Mac: $cn; сервер: $sn" \
+        "Включите синхронизацию времени: на сервере timedatectl set-ntp true, на Mac — Дата и время → автоматически. Для XRay/Reality расхождение больше 90 с ломает подключение."
+    fi
+  fi
+  [ "$(getf S_NTP_SYNC)" = no ] && add WARN SRV06 "На сервере не синхронизировано время" "NTPSynchronized=no" "timedatectl set-ntp true"
+  if [ "$(getf S_OUT_HTTP)" = 000 ]; then
+    add FAIL SRV07 "У сервера нет выхода в интернет" "curl https://1.1.1.1 с сервера не прошёл" \
+      "VPN не сможет пропускать трафик. Проверьте маршрут по умолчанию, DNS и ограничения хостера."
+  fi
+  [ "$(getf S_DNS_OK)" = no ] && add WARN SRV08 "На сервере не работает DNS" "getent hosts one.one.one.one: ошибка" "Проверьте /etc/resolv.conf и systemd-resolved."
+  [ "$(getf S_TARGET_IP_ON_IF)" = no ] && add INFO SRV09 "IP сервера не назначен на его интерфейс (NAT у хостера)" \
+    "IP подключения: $(getf N_TARGET_IP); внешний интерфейс: $(getf S_DEFAULT_IF)" "Обычно не мешает. Если порты недоступны снаружи — проверьте проброс портов/файрвол в панели хостера."
+  return 0
+}
+
+port_allowed_ufw() {  # $1 port
+  case " $(getf S_UFW_ALLOW) " in *" $1/udp "*|*" $1 "*) return 0 ;; esac
+  return 1
+}
+
+an_vpn() {
+  local nif amz down flap i name scope port peers recent fwd masq ufw pol jc
+  nif="$(getf S_IF_COUNT)"; isnum "$nif" || nif=0
+  amz="$(getf S_AMNEZIA_CONTAINERS)"; down="$(getf S_CONTAINERS_DOWN)"; flap="$(getf S_CONTAINERS_FLAPPING)"
+
+  if [ "$(getf S_HAS_DOCKER)" = yes ] && [ "$(getf S_DOCKER_DAEMON)" = no ]; then
+    add FAIL VPN02 "Docker установлен, но не запущен" "docker info: ошибка" "systemctl start docker && systemctl enable docker"
+  fi
+  if [ "$nif" = 0 ] && [ -z "$amz" ]; then
+    add FAIL VPN01 "На сервере не найден VPN: нет интерфейсов awg/wg и контейнеров Amnezia" \
+      "awg: $(getf S_HAS_AWG); модуль amneziawg: $(getf S_AWG_MODULE); docker: $(getf S_HAS_DOCKER); контейнеры: $(getf S_CONTAINERS)" \
+      "Установите Amnezia: в приложении «Настроить ваш сервер» либо вручную AmneziaWG. Если ставили вручную и модуль не загружен: modprobe amneziawg, systemctl start awg-quick@awg0."
+    return
+  fi
+  [ -n "$down" ] && add FAIL VPN03 "Контейнеры VPN не запущены: $down" "docker ps -a" \
+    "docker start $down. Причина остановки — в raw/server/docker_logs_*.txt."
+  [ -n "$flap" ] && add WARN VPN04 "Контейнер перезапускается: $flap" "RestartCount ≥ 3" \
+    "Смотрите логи контейнера. Частые причины: нехватка памяти (OOM), занятый порт, битый конфиг."
+
+  fwd="$(getf S_IP_FORWARD)"; masq="$(getf S_NAT_MASQ_COUNT)"; ufw="$(getf S_UFW_ACTIVE)"; pol="$(getf S_IPT_INPUT_POLICY)"
+  local host_if=0
+  i=1
+  while [ "$i" -le "$nif" ]; do
+    name="$(getf "S_IF_${i}_NAME")"; scope="$(getf "S_IF_${i}_SCOPE")"; port="$(getf "S_IF_${i}_PORT")"
+    peers="$(getf "S_IF_${i}_PEERS")"; recent="$(getf "S_IF_${i}_PEERS_RECENT")"
+    jc="$(getf "S_IF_${i}_K_JC")"
+    add OK VPN05 "Интерфейс $name ($scope) слушает UDP $port" "пиров: $peers; на связи за 3 мин: $recent; обфускация AmneziaWG: ${jc:+да, jc=}${jc:-нет (обычный WireGuard)}" ""
+    if [ "$peers" = 0 ]; then
+      add WARN VPN06 "На интерфейсе $name нет ни одного клиента" "" "Выпустите клиентский конфиг."
+    elif [ "$recent" = 0 ]; then
+      add INFO VPN07 "Сейчас к $name никто не подключён" "рукопожатий за последние 3 минуты нет" \
+        "Если VPN на устройстве включён, а рукопожатий нет — причина ниже: доставка UDP или несовпадение конфига."
+    fi
+    if [ "$scope" = host ]; then
+      host_if=1
+      if [ "$ufw" = yes ] && ! port_allowed_ufw "$port"; then
+        add FAIL FW03 "ufw не пропускает UDP $port" "разрешено: $(getf S_UFW_ALLOW)" "ufw allow $port/udp"
+      elif [ "$ufw" != yes ] && [ "$pol" = DROP ]; then
+        case " $(getf S_IPT_UDP_DPORTS) " in
+          *" $port "*) ;;
+          *) add WARN FW04 "Политика INPUT = DROP, явного разрешения UDP $port не видно" "UDP ACCEPT: $(getf S_IPT_UDP_DPORTS)" \
+               "iptables -I INPUT -p udp --dport $port -j ACCEPT (и сохранить правила)" ;;
+        esac
+      fi
+    fi
+    i=$((i + 1))
+  done
+
+  if [ "$fwd" = 0 ]; then
+    add FAIL FW01 "Выключен IP-форвардинг: клиенты подключатся, но без интернета" "net.ipv4.ip_forward=0" \
+      "sysctl -w net.ipv4.ip_forward=1 и строка net.ipv4.ip_forward=1 в /etc/sysctl.d/99-forward.conf"
+  fi
+  if [ "$host_if" = 1 ] && [ "$masq" = 0 ]; then
+    add FAIL FW02 "Нет NAT (MASQUERADE): трафик клиентов не выходит в интернет" "iptables -t nat: MASQUERADE не найден" \
+      "Добавьте в [Interface] конфига сервера: PostUp = iptables -t nat -A POSTROUTING -s <подсеть VPN> -o $(getf S_DEFAULT_IF) -j MASQUERADE"
+  fi
+}
+
+an_f2b() {
+  if [ "$(getf S_F2B_BANS_SSH_CLIENT)" = yes ] || [ "$(getf S_F2B_BANS_CLIENT_PUBLIC)" = yes ]; then
+    add FAIL FW05 "Ваш IP заблокирован fail2ban" "IP по SSH: $(getf S_SSH_CLIENT_IP); публичный IP Mac: $(getf C_PUBLIC_IP)" \
+      "fail2ban-client unban <IP>. Затем разберитесь, почему были неудачные входы."
+  elif isnum "$(getf S_F2B_BANNED_COUNT)" && [ "$(getf S_F2B_BANNED_COUNT)" -gt 0 ]; then
+    add INFO FW06 "fail2ban держит в бане $(getf S_F2B_BANNED_COUNT) адресов (ваших среди них нет)" "jails: $(getf S_F2B_JAILS)" ""
+  fi
+}
+
+an_probe() {
+  local st ports p v got via note
+  st="$(getf N_PROBE_STATUS)"; via="$(getf N_PROBE_VIA_IF)"
+  note=""
+  case "$via" in utun*) note=" Внимание: пакеты шли через активный VPN ($via) — результат отражает путь этого VPN, а не провайдера." ;; esac
+  case "$st" in
+    ok) ;;
+    skipped:no_tcpdump) add INFO PRB00 "Проверка доставки UDP пропущена: на сервере нет tcpdump" "" \
+      "Для этой проверки: apt install -y tcpdump — и повторите запуск. Скрипт сам ничего не устанавливает."; return ;;
+    skipped:no_root) add INFO PRB00 "Проверка доставки UDP пропущена: нужен root" "" "Запустите от root."; return ;;
+    skipped:no_udp_ports) add INFO PRB00 "Проверка доставки UDP пропущена: на сервере нет UDP-портов VPN" "" ""; return ;;
+    skipped:*) return ;;
+    error:*) add WARN PRB05 "Проверка доставки UDP не удалась" "$st; см. raw/probe_capture.txt" "Повторите запуск."; return ;;
+    *) return ;;
+  esac
+  ports="$(getf N_PROBE_UDP_PORTS)"
+  for p in $ports; do
+    v="$(getf "N_PROBE_UDP_$p")"; got="${v%%/*}"
+    if [ "$got" = 0 ]; then
+      add FAIL PRB01 "UDP на порт $p не доходит до сервера из этой сети" "отправлено 5, получено 0; маршрут: $via" \
+        "Пакеты режутся по дороге: провайдер или DPI, мобильный оператор, файрвол хостера. Проверьте с другой сети. Варианты: сменить порт VPN; использовать протокол поверх TCP 443 (XRay/Reality в Amnezia).$note"
+    elif [ "$got" -lt 5 ]; then
+      add WARN PRB02 "Часть UDP-пакетов на порт $p теряется" "получено $v; маршрут: $via" \
+        "Нестабильный канал или частичная фильтрация. Сравните с другой сетью.$note"
+    else
+      add OK PRB03 "UDP на порт $p доходит до сервера" "получено $v; маршрут: $via" ""
+    fi
+  done
+  for p in $(getf N_PROBE_TCP_PORTS); do
+    [ "$(getf "N_PROBE_TCP_$p")" = closed ] && add WARN PRB04 "TCP $p слушается на сервере, но снаружи недоступен" "nc -z: нет соединения" \
+      "Проверьте ufw и файрвол в панели хостера для TCP $p."
+  done
+}
+
+an_config() {
+  [ "$(getf K_PRESENT)" = yes ] || return
+  if [ "$(getf K_PARSE)" != ok ]; then
+    add FAIL CFG01 "Не удалось разобрать клиентский конфиг" "$(getf K_PARSE_ERROR)" \
+      "Передайте файл .conf целиком или файл, где лежит ключ vpn:// целиком."
+    return
+  fi
+  local tip host khost kport kpub kaddr ip nif m j
+  tip="$(getf N_TARGET_IP)"; host="$(getf N_TARGET_HOST)"
+  khost="$(getf K_ENDPOINT_HOST)"; kport="$(getf K_ENDPOINT_PORT)"; kpub="$(getf K_SERVER_PUBKEY)"
+  if [ -n "$khost" ] && [ "$khost" != "$tip" ] && [ "$khost" != "$host" ]; then
+    add WARN CFG02 "Конфиг указывает на другой адрес: $khost" "проверяемый сервер: $host ($tip)" \
+      "Если IP сервера менялся — перевыпустите конфиг. Если это другой сервер — запустите диагностику для него."
+  fi
+
+  local mtu
+  mtu="$(getf K_MTU)"
+  if isnum "$mtu" && [ "$mtu" -gt 1420 ]; then
+    add WARN CFG10 "MTU в конфиге $mtu — слишком большой" "" "Поставьте MTU = 1280: надёжно в мобильных сетях и через двойной NAT."
+  elif [ -z "$mtu" ]; then
+    add INFO CFG10 "MTU в конфиге не задан" "" "Если «подключается, но не грузит» — добавьте MTU = 1280."
+  fi
+  if isnum "$(getf C_IPV6_GLOBAL)" && [ "$(getf C_IPV6_GLOBAL)" -gt 0 ]; then
+    case "$(getf K_ALLOWED_IPS)" in
+      *::/0*) ;;
+      *) add WARN CFG11 "Утечка IPv6: у Mac есть IPv6, а конфиг заворачивает только IPv4" "AllowedIPs: $(getf K_ALLOWED_IPS)" \
+           "Добавьте ::/0 в AllowedIPs." ;;
+    esac
+  fi
+  [ "$(getf K_PROTOCOL)" != xray ] && [ -z "$(getf K_DNS)" ] && add WARN CFG12 "В конфиге не задан DNS" "" "Добавьте DNS = 1.1.1.1, 8.8.8.8 — иначе имена резолвятся мимо туннеля или не резолвятся."
+
+  [ "$(getf P_DONE)" = yes ] || return
+  nif="$(getf S_IF_COUNT)"; isnum "$nif" || nif=0
+  m=0; j=1
+  while [ "$j" -le "$nif" ]; do
+    if [ -n "$kpub" ] && [ "$(getf "S_IF_${j}_PUBKEY")" = "$kpub" ]; then m=$j; break; fi
+    j=$((j + 1))
+  done
+  if [ "$m" = 0 ]; then
+    j=1
+    while [ "$j" -le "$nif" ]; do
+      if [ -n "$kport" ] && [ "$(getf "S_IF_${j}_PORT")" = "$kport" ]; then m=$j; break; fi
+      j=$((j + 1))
+    done
+  fi
+  if [ "$m" = 0 ]; then
+    add FAIL CFG03 "Порт $kport из конфига не слушает ни один VPN-интерфейс сервера" "порты сервера: $(j=1; while [ "$j" -le "$nif" ]; do printf '%s ' "$(getf "S_IF_${j}_PORT")"; j=$((j + 1)); done)" \
+      "Порт сменился после переустановки или конфиг от другого сервера. Перевыпустите конфиг."
+    return
+  fi
+  if [ -n "$kpub" ] && [ "$(getf "S_IF_${m}_PUBKEY")" != "$kpub" ]; then
+    add FAIL CFG04 "Ключ сервера в конфиге не совпадает с сервером — конфиг от другой установки" \
+      "в конфиге: ${kpub:0:12}…; на сервере ($(getf "S_IF_${m}_NAME")): $(getf "S_IF_${m}_PUBKEY" | cut -c1-12)…" \
+      "Ключи сменились при переустановке. Перевыпустите конфиг на текущем сервере."
+  fi
+
+  local prm kv sv diff="" n
+  for prm in JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5; do
+    kv="$(getf "K_$prm")"; sv="$(getf "S_IF_${m}_K_$prm")"
+    case "$prm" in
+      H[1-4]) n="${prm#H}"; [ -z "$kv" ] && kv="$n"; [ -z "$sv" ] && sv="$n" ;;
+      *) [ -z "$kv" ] && kv=0; [ -z "$sv" ] && sv=0 ;;
+    esac
+    [ "$kv" != "$sv" ] && diff="$diff $prm(конфиг $kv, сервер $sv)"
+  done
+  if [ -n "$diff" ]; then
+    add FAIL CFG05 "Параметры обфускации AmneziaWG не совпадают" "$diff" \
+      "Используйте конфиг, выданный именно этим сервером. Обычный WireGuard-клиент не поддерживает AmneziaWG — нужен AmneziaVPN или AmneziaWG-клиент."
+  fi
+
+  kaddr="$(getf K_ADDRESS)"; ip="${kaddr%%,*}"; ip="${ip%%/*}"; ip="$(printf '%s' "$ip" | tr -d ' ')"
+  [ -z "$ip" ] && return
+  local peers q found=0 age
+  peers="$(getf "S_IF_${m}_PEERS")"; isnum "$peers" || peers=0
+  [ "$peers" -gt 64 ] && peers=64
+  q=1
+  while [ "$q" -le "$peers" ]; do
+    case ",$(getf "S_IF_${m}_PEER_${q}_ALLOWED")," in *",$ip/"*) found=$q; break ;; esac
+    q=$((q + 1))
+  done
+  if [ "$found" = 0 ]; then
+    add FAIL CFG06 "Клиента $ip нет среди пиров сервера" "интерфейс $(getf "S_IF_${m}_NAME"), пиров: $(getf "S_IF_${m}_PEERS")" \
+      "Пир удалён или конфиг от другой установки. Перевыпустите конфиг."
+    return
+  fi
+  age="$(getf "S_IF_${m}_PEER_${found}_HS_AGE")"
+  if [ "$age" = never ]; then
+    add WARN CFG07 "Клиент $ip ни разу не подключался" "рукопожатий не было" \
+      "Включите VPN на устройстве и повторите диагностику. Если UDP доходит, а рукопожатия нет — несовпадение ключей: перевыпустите конфиг."
+  elif isnum "$age" && [ "$age" -gt 180 ]; then
+    add INFO CFG08 "Клиент $ip подключался $age с назад" "принято: $(getf "S_IF_${m}_PEER_${found}_RX") Б; отправлено: $(getf "S_IF_${m}_PEER_${found}_TX") Б" ""
+  else
+    add OK CFG09 "Клиент $ip на связи: рукопожатие $age с назад" "принято: $(getf "S_IF_${m}_PEER_${found}_RX") Б; отправлено: $(getf "S_IF_${m}_PEER_${found}_TX") Б" ""
+  fi
+}
+
+an_client() {
+  [ "$(getf C_HTTP_1111)" = 000 ] && add FAIL CLI01 "У Mac нет доступа в интернет" "curl https://1.1.1.1: нет ответа" \
+    "Проверьте Wi-Fi или кабель. Если включён VPN — выключите его и повторите: возможно, сломан именно он."
+  [ "$(getf C_DNS_RESOLVE)" = no ] && add WARN CLI02 "На Mac не работает DNS" "DNS: $(getf C_DNS_SERVERS)" \
+    "Если включён VPN — проверьте строку DNS в конфиге. Без VPN — настройки сети."
+  [ -n "$(getf C_OTHER_VPN_PROCS)" ] && add WARN CLI03 "Запущены другие VPN или прокси: $(getf C_OTHER_VPN_PROCS)" "utun-интерфейсов: $(getf C_UTUN_COUNT)" \
+    "Закройте их на время работы Amnezia: они перехватывают маршруты и DNS."
+  [ -n "$(getf C_PROXY)" ] && add WARN CLI04 "Включён системный прокси: $(getf C_PROXY)" "" \
+    "Системные настройки → Сеть → Подробнее → Прокси: выключите, если не нужен."
+  [ "$(getf C_AMNEZIA_APP)" = absent ] && add INFO CLI05 "Приложение AmneziaVPN не найдено в /Applications" "" \
+    "Установите с amnezia.org, если подключаетесь им."
+  case "$(getf C_ROUTE_TO_TARGET_IF)" in
+    utun*) add INFO CLI06 "Трафик к серверу идёт через VPN-интерфейс $(getf C_ROUTE_TO_TARGET_IF)" "VPN-процессы: $(getf C_VPN_PROCS)" \
+      "Проверки сети описывают путь через этот VPN. Если он подключён к другому серверу, для чистого результата выключите его." ;;
+  esac
+  if [ -n "$(getf C_PUBLIC_IP)" ] && [ "$(getf C_PUBLIC_IP)" = "$(getf N_TARGET_IP)" ]; then
+    add OK CLI08 "Mac выходит в интернет через этот сервер — VPN включён и работает" "публичный IP Mac = IP сервера" ""
+  fi
+  isnum "$(getf C_AMNEZIA_LOG_ERR)" && [ "$(getf C_AMNEZIA_LOG_ERR)" -gt 0 ] && \
+    add INFO CLI07 "В логах Amnezia на Mac есть строки с ошибками: $(getf C_AMNEZIA_LOG_ERR)" "файлов: $(getf C_AMNEZIA_LOG_FILES)" \
+      "Смотрите raw/client/amnezia_logs.txt и raw/client/amnezia_unified_log.txt."
+}
+
+an_security() {
+  [ "$(getf P_DONE)" = yes ] || return
+  if [ "$(getf S_SSHD_PASSWORDAUTHENTICATION)" = yes ] && [ "$(getf S_SSHD_PERMITROOTLOGIN)" = yes ]; then
+    add WARN SEC01 "Разрешён вход root по паролю" "PasswordAuthentication yes, PermitRootLogin yes" \
+      "После настройки входа по ключу: PasswordAuthentication no и PermitRootLogin prohibit-password в /etc/ssh/sshd_config.d/00-hardening.conf (файл должен идти первым по алфавиту)."
+  fi
+}
+
+analyze() {
+  FIND="$OUT/findings.tsv"
+  : > "$FIND"
+  an_network
+  an_ssh
+  if an_server; then
+    an_vpn
+    an_f2b
+  fi
+  an_probe
+  an_config
+  an_client
+  an_security
+}
+
+# ================================================================ отчёты
+
+write_reports() {
+  local first status label pid ptitle prec
+  first="$(awk -F'\t' '$1=="FAIL"{print; exit}' "$FIND")"
+  [ -z "$first" ] && first="$(awk -F'\t' '$1=="WARN"{print; exit}' "$FIND")"
+  status="$(printf '%s' "$first" | cut -f1)"
+  pid="$(printf '%s' "$first" | cut -f2)"
+  ptitle="$(printf '%s' "$first" | cut -f3)"
+  prec="$(printf '%s' "$first" | cut -f5)"
+  case "$status" in
+    FAIL) label="НЕИСПРАВНО" ;;
+    WARN) label="РАБОТАЕТ С ЗАМЕЧАНИЯМИ" ;;
+    *) status=OK; label="ИСПРАВНО" ;;
+  esac
+  VERDICT_LABEL="$label"; VERDICT_TITLE="$ptitle"
+
+  {
+    echo "# Amnezia Doctor — отчёт"
+    echo
+    echo "| | |"
+    echo "|---|---|"
+    echo "| Версия | $(getf META_VERSION) ($(getf META_SCHEMA)) |"
+    echo "| Сервер | \`$(getf META_TARGET)\` |"
+    echo "| Время запуска | $(getf META_STARTED) |"
+    echo "| Mac | macOS $(getf C_MACOS), $(getf C_ARCH) |"
+    echo
+    echo "## Вердикт: $label"
+    echo
+    if [ "$status" = OK ]; then
+      echo "Проблем не найдено."
+    else
+      echo "**Главная причина — [$pid] $ptitle**"
+      echo
+      [ -n "$prec" ] && echo "Что сделать: $prec"
+    fi
+    echo
+    local lvl head
+    for lvl in FAIL WARN INFO; do
+      case "$lvl" in FAIL) head="Неисправности" ;; WARN) head="Замечания" ;; INFO) head="К сведению" ;; esac
+      if awk -F'\t' -v l="$lvl" '$1==l{f=1} END{exit !f}' "$FIND"; then
+        echo "## $head ($lvl)"
+        echo
+        awk -F'\t' -v l="$lvl" '$1==l {
+          printf "- **[%s] %s**\n", $2, $3
+          if ($4 != "") printf "  - Факты: %s\n", $4
+          if ($5 != "") printf "  - Что сделать: %s\n", $5
+        }' "$FIND"
+        echo
+      fi
+    done
+    if awk -F'\t' '$1=="OK"{f=1} END{exit !f}' "$FIND"; then
+      echo "## Работает (OK)"
+      echo
+      awk -F'\t' '$1=="OK" { printf "- [%s] %s%s\n", $2, $3, ($4 != "" ? " — " $4 : "") }' "$FIND"
+      echo
+    fi
+    echo "## Все факты"
+    echo
+    echo "Префиксы: META — запуск, C — Mac, N — сеть, K — клиентский конфиг, S — сервер, P — пробник."
+    echo
+    echo '```text'
+    cat "$FACTS"
+    echo '```'
+    echo
+    echo "## Сырые логи"
+    echo
+    ( cd "$OUT" && find raw -type f 2>/dev/null | LC_ALL=C sort | sed 's/^/- /' )
+  } > "$OUT/report.md"
+
+  perl "$LIB/to_json.pl" "$FACTS" "$FIND" "$status" "$pid" "$ptitle" > "$OUT/report.json"
+  cp "$SELF_DIR/docs/LLM_PROMPT.md" "$OUT/LLM_PROMPT.md" 2>/dev/null
+}
+
+normalize_facts() {
+  # первое значение ключа побеждает; сортировка — для стабильности отчёта
+  awk '{ k = $0; sub(/=.*/, "", k); if (!(k in s)) { s[k] = 1; print } }' "$FACTS" | LC_ALL=C sort > "$FACTS.tmp" && mv "$FACTS.tmp" "$FACTS"
+}
+
+# ================================================================ main
+
+if [ -n "$ANALYZE_DIR" ]; then
+  OUT="$(cd "$ANALYZE_DIR" && pwd)" || exit 2
+  FACTS="$OUT/facts.txt"
+  [ -f "$FACTS" ] || { say "Нет файла $FACTS"; exit 2; }
+  normalize_facts
+  analyze
+  write_reports
+  say "Вердикт: $VERDICT_LABEL${VERDICT_TITLE:+ — $VERDICT_TITLE}"
+  say "Отчёт: $OUT/report.md"
+  exit 0
+fi
+
+if [ -z "$TARGET" ]; then usage >&2; exit 2; fi
+HOST="${TARGET#*@}"
+TIP=""
+
+[ -z "$OUT_BASE" ] && { [ -d "$HOME/Desktop" ] && OUT_BASE="$HOME/Desktop" || OUT_BASE="$(pwd)"; }
+NAME="amnezia-doctor_$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9.-' '_')_$(date +%Y%m%d-%H%M%S)"
+OUT="$OUT_BASE/$NAME"
+RAW="$OUT/raw"
+mkdir -p "$RAW/client" "$RAW/server" || exit 1
+FACTS="$OUT/facts.txt"
+: > "$FACTS"
+CTL="$(mktemp -d /tmp/amzd.XXXXXX)"
+SSH_BASE=()
+cleanup() {
+  ssh -o "ControlPath=$CTL/%C" -p "$SSH_PORT" -O exit "$TARGET" >/dev/null 2>&1
+  rm -rf "$CTL"
+}
+trap cleanup EXIT
+
+say "amnezia-doctor $VERSION → $TARGET"
+say "Результат: $OUT"
+setf META_SCHEMA "$SCHEMA"
+setf META_VERSION "$VERSION"
+setf META_TARGET "$TARGET"
+setf META_STARTED "$(date '+%Y-%m-%d %H:%M:%S %z')"
+setf META_PROBE "$([ "$DO_PROBE" = 1 ] && echo on || echo off)"
+
+collect_client
+collect_client_cfg
+collect_network
+collect_server
+collect_probe
+
+step "Анализ"
+normalize_facts
+analyze
+write_reports
+( cd "$OUT_BASE" && zip -qr "$NAME.zip" "$NAME" )
+
+printf '\n========================================\n' >&2
+say "Вердикт: $VERDICT_LABEL${VERDICT_TITLE:+ — $VERDICT_TITLE}"
+awk -F'\t' '$1=="FAIL" || $1=="WARN" { printf "  %s [%s] %s\n", $1, $2, $3 }' "$OUT/findings.tsv" >&2
+say ""
+say "Отчёт:  $OUT/report.md"
+say "Архив:  $OUT_BASE/$NAME.zip  ← его и пришлите"
